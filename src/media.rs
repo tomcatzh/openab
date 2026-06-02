@@ -93,10 +93,7 @@ fn hex_prefix(body: &[u8]) -> String {
 /// (`image/*`) because CDNs commonly serve any file type as `application/octet-stream`;
 /// rejecting that header would silently break real downloads. The magic-byte check
 /// examines the actual bytes regardless of what the server claims.
-fn validate_image_response(
-    content_type: Option<&str>,
-    body: &[u8],
-) -> Result<(), MediaFetchError> {
+fn validate_image_response(content_type: Option<&str>, body: &[u8]) -> Result<(), MediaFetchError> {
     // Reject explicitly-text responses early (e.g. Slack HTML login page at HTTP 200).
     // application/octet-stream and other generic types pass through to magic-byte check.
     if let Some(ct) = content_type {
@@ -339,7 +336,11 @@ pub async fn download_and_transcribe(
     };
 
     if bytes.len() as u64 > MAX_SIZE {
-        error!(filename, size = bytes.len(), "downloaded audio exceeds 25MB limit");
+        error!(
+            filename,
+            size = bytes.len(),
+            "downloaded audio exceeds 25MB limit"
+        );
         return None;
     }
 

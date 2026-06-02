@@ -195,7 +195,12 @@ impl GatewayAdapter {
             return Err(e.into());
         }
         let msg_id = if let (Some(rx), Some(ref id)) = (pending_rx, &req_id) {
-            match tokio::time::timeout(std::time::Duration::from_secs(GATEWAY_REPLY_TIMEOUT_SECS), rx).await {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(GATEWAY_REPLY_TIMEOUT_SECS),
+                rx,
+            )
+            .await
+            {
                 Ok(Ok(resp)) if resp.success => resp.message_id.unwrap_or_else(|| "gw_sent".into()),
                 Ok(Ok(_resp)) => {
                     tracing::warn!(request_id = %id, "gateway replied with failure");
@@ -395,7 +400,8 @@ impl ChatAdapter for GatewayAdapter {
         content: &str,
         reply_to_message_id: &str,
     ) -> Result<MessageRef> {
-        self.send_gateway_reply(channel, content, Some(reply_to_message_id)).await
+        self.send_gateway_reply(channel, content, Some(reply_to_message_id))
+            .await
     }
 
     async fn create_thread(
@@ -856,6 +862,7 @@ pub async fn run_gateway_adapter(
                                             sender_json,
                                             sender_name,
                                             prompt,
+                                            cwd_request: None,
                                             extra_blocks,
                                             trigger_msg,
                                             arrived_at: std::time::Instant::now(),

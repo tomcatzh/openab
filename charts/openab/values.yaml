@@ -322,6 +322,17 @@ agents:
     pool:
       maxSessions: 10
       sessionTtlHours: 24
+      # Upstream-compatible feature flag from PR #41 direction.
+      # When true, sessions without an explicit cwd use
+      # <workingDir>/sessions/<thread_key>/.
+      perThreadWorkdir: false
+      # Local project-cwd routing extension:
+      # off | optional | required
+      cwdDirective: "off"
+      # Absolute roots allowed for [cwd:/path] / [[cwd:/path]] routing.
+      cwdAllowedRoots: []
+      # If true, missing cwd paths under allowed roots are created.
+      cwdCreateMissing: false
     reactions:
       enabled: true
       removeAfterReply: false

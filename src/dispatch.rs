@@ -19,7 +19,7 @@ use tracing::{debug, error, info, info_span, warn};
 
 use crate::acp::ContentBlock;
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef};
-use crate::config::ReactionsConfig;
+use crate::config::{CwdDirectiveMode, CwdDirectiveRequest, ReactionsConfig};
 use crate::error_display::format_user_error;
 use crate::reactions::StatusReactionController;
 
@@ -37,6 +37,9 @@ pub struct BufferedMessage {
     pub sender_name: String,
     /// User-visible prompt text (verbatim, never transformed).
     pub prompt: String,
+    /// Pre-parsed cwd directive from adapters that must validate before
+    /// creating platform-specific resources such as Discord threads.
+    pub cwd_request: Option<CwdDirectiveRequest>,
     /// Attachment blocks (images, STT transcripts) in arrival order.
     pub extra_blocks: Vec<ContentBlock>,
     /// Anchor for reactions (👀 / ❌).
@@ -117,8 +120,14 @@ impl ThreadHandle {
 pub trait DispatchTarget: Send + Sync + 'static {
     fn reactions_config(&self) -> &ReactionsConfig;
 
+    fn cwd_directive_mode(&self) -> CwdDirectiveMode;
+
     /// Ensure the ACP session for `session_key` exists (idempotent).
-    async fn ensure_session(&self, session_key: &str) -> Result<()>;
+    async fn ensure_session(
+        &self,
+        session_key: &str,
+        cwd_request: Option<&CwdDirectiveRequest>,
+    ) -> Result<()>;
 
     /// Drive one ACP turn with the pre-packed `content_blocks`.
     #[allow(clippy::too_many_arguments)]
@@ -139,8 +148,16 @@ impl DispatchTarget for AdapterRouter {
         AdapterRouter::reactions_config(self)
     }
 
-    async fn ensure_session(&self, session_key: &str) -> Result<()> {
-        self.pool().get_or_create(session_key).await
+    fn cwd_directive_mode(&self) -> CwdDirectiveMode {
+        self.pool().cwd_directive_mode()
+    }
+
+    async fn ensure_session(
+        &self,
+        session_key: &str,
+        cwd_request: Option<&CwdDirectiveRequest>,
+    ) -> Result<()> {
+        self.pool().get_or_create(session_key, cwd_request).await
     }
 
     async fn stream_prompt_blocks(
@@ -265,6 +282,10 @@ impl Dispatcher {
             BatchGrouping::Thread => format!("{platform}:{thread_id}"),
             BatchGrouping::Lane => format!("{platform}:{thread_id}:{sender_id}"),
         }
+    }
+
+    pub fn cwd_directive_mode(&self) -> CwdDirectiveMode {
+        self.target.cwd_directive_mode()
     }
 
     /// Build the shared session pool key for a routed channel.
@@ -613,10 +634,68 @@ async fn dispatch_batch(
     // Anchor reactions on the last message in the batch (before consuming).
     let trigger_msg = batch.last().unwrap().trigger_msg.clone();
 
+    let mut cwd_request: Option<CwdDirectiveRequest> = None;
+    let mut cleaned_batch = Vec::with_capacity(batch.len());
+    for mut msg in batch {
+        let adapter_cwd = msg.cwd_request.take();
+        match AdapterRouter::extract_cwd_directive(&msg.prompt) {
+            Ok((cwd, cleaned_prompt)) => {
+                let cwd = match (adapter_cwd, cwd) {
+                    (Some(adapter_cwd), Some(prompt_cwd)) => {
+                        match adapter_cwd.prefer_create(prompt_cwd) {
+                            Ok(cwd) => Some(cwd),
+                            Err(e) => {
+                                let _ = adapter
+                                    .send_message(
+                                        thread_channel,
+                                        "⚠️ conflicting cwd directives in one message; start a new thread with one cwd",
+                                    )
+                                    .await;
+                                error!("conflicting adapter and prompt cwd directives in dispatch_batch: {e}");
+                                return;
+                            }
+                        }
+                    }
+                    (Some(adapter_cwd), _) => Some(adapter_cwd),
+                    (None, prompt_cwd) => prompt_cwd,
+                };
+                if let Some(cwd) = cwd {
+                    if let Some(existing) = cwd_request.take() {
+                        match existing.prefer_create(cwd) {
+                            Ok(merged) => cwd_request = Some(merged),
+                            Err(e) => {
+                                let _ = adapter
+                                    .send_message(
+                                        thread_channel,
+                                        "⚠️ conflicting cwd directives in one batch; start a new thread with one cwd",
+                                    )
+                                    .await;
+                                error!("conflicting cwd directives in dispatch_batch: {e}");
+                                return;
+                            }
+                        }
+                    } else {
+                        cwd_request = Some(cwd);
+                    }
+                }
+                msg.prompt = cleaned_prompt;
+                cleaned_batch.push(msg);
+            }
+            Err(e) => {
+                let user_msg = format_user_error(&e.to_string());
+                let _ = adapter
+                    .send_message(thread_channel, &format!("⚠️ {user_msg}"))
+                    .await;
+                error!("cwd directive parse error in dispatch_batch: {e}");
+                return;
+            }
+        }
+    }
+
     // Pack all arrival events into one Vec<ContentBlock> (§3.3).
     // Uses into_iter() to avoid deep-copying extra_blocks (may contain base64 image data).
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
-    for msg in batch {
+    for msg in cleaned_batch {
         let mut event_blocks =
             AdapterRouter::pack_arrival_event(&msg.sender_json, &msg.prompt, msg.extra_blocks);
         content_blocks.append(&mut event_blocks);
@@ -624,7 +703,10 @@ async fn dispatch_batch(
     let packed_block_count = content_blocks.len();
 
     // Ensure session exists.
-    if let Err(e) = target.ensure_session(&session_key).await {
+    if let Err(e) = target
+        .ensure_session(&session_key, cwd_request.as_ref())
+        .await
+    {
         let user_msg = format_user_error(&e.to_string());
         let _ = adapter
             .send_message(thread_channel, &format!("⚠️ {user_msg}"))
@@ -1067,7 +1149,14 @@ mod tests {
             env: std::collections::HashMap::new(),
             inherit_env: vec![],
         };
-        let pool = Arc::new(SessionPool::new(agent_cfg, 1));
+        let pool = Arc::new(SessionPool::new(
+            agent_cfg,
+            1,
+            false,
+            crate::config::CwdDirectiveMode::Off,
+            Vec::new(),
+            false,
+        ));
         let router = Arc::new(AdapterRouter::new(
             pool,
             crate::config::ReactionsConfig::default(),
@@ -1263,7 +1352,15 @@ mod tests {
             &self.reactions
         }
 
-        async fn ensure_session(&self, _session_key: &str) -> Result<()> {
+        fn cwd_directive_mode(&self) -> CwdDirectiveMode {
+            CwdDirectiveMode::Off
+        }
+
+        async fn ensure_session(
+            &self,
+            _session_key: &str,
+            _cwd_request: Option<&CwdDirectiveRequest>,
+        ) -> Result<()> {
             if let Some(msg) = self.ensure_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
             }
@@ -1347,6 +1444,7 @@ mod tests {
                 .into(),
             sender_name: "u".into(),
             prompt: prompt.into(),
+            cwd_request: None,
             extra_blocks: vec![],
             trigger_msg: MessageRef {
                 channel: make_channel("T"),

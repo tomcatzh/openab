@@ -158,6 +158,10 @@ data:
     [pool]
     max_sessions = {{ ($cfg.pool).maxSessions | default 10 }}
     session_ttl_hours = {{ ($cfg.pool).sessionTtlHours | default 24 }}
+    per_thread_workdir = {{ if hasKey (($cfg.pool) | default dict) "perThreadWorkdir" }}{{ ($cfg.pool).perThreadWorkdir }}{{ else }}false{{ end }}
+    cwd_directive = {{ (($cfg.pool).cwdDirective | default "off") | toJson }}
+    cwd_allowed_roots = {{ (($cfg.pool).cwdAllowedRoots | default list) | toJson }}
+    cwd_create_missing = {{ if hasKey (($cfg.pool) | default dict) "cwdCreateMissing" }}{{ ($cfg.pool).cwdCreateMissing }}{{ else }}false{{ end }}
 
     [reactions]
     enabled = {{ if hasKey ($cfg.reactions) "enabled" }}{{ ($cfg.reactions).enabled }}{{ else }}true{{ end }}

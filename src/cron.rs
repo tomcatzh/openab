@@ -630,8 +630,7 @@ async fn fire_cronjob(
                 DisableOnSuccessResult::NotAchieved(reason) => {
                     info!(
                         id = job.id.as_deref().unwrap_or(""),
-                        reason,
-                        "disable_on_success not achieved, firing cronjob normally"
+                        reason, "disable_on_success not achieved, firing cronjob normally"
                     );
                 }
             }
@@ -711,7 +710,7 @@ async fn fire_cronjob(
             .or(Some(reply_channel.channel_id.clone())),
         is_bot: true,
         timestamp: Some(Utc::now().to_rfc3339()),
-        message_id: None, // cron jobs don't originate from a message
+        message_id: None,  // cron jobs don't originate from a message
         receiver_id: None, // cron jobs are self-triggered, no external receiver
     };
     let sender_json = match serde_json::to_string(&sender) {

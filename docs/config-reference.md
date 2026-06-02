@@ -173,6 +173,10 @@ Session pool settings for managing concurrent agent sessions.
 |-----|------|---------|-------------|
 | `max_sessions` | usize | `10` | Maximum number of concurrent agent sessions. When full, the oldest idle session is suspended (recoverable); if all sessions are busy, new requests are rejected. |
 | `session_ttl_hours` | u64 | `4` | Session time-to-live in hours. Idle sessions are reclaimed after this period. The example config uses `24`. |
+| `per_thread_workdir` | bool | `false` | When enabled, sessions without explicit cwd routing use `<working_dir>/sessions/<thread_key>/`. Aligned with the upstream per-thread workdir direction. |
+| `cwd_directive` | string | `"off"` | Controls first-message cwd routing via `[cwd:/path]` or `[[cwd:/path]]`. Values: `"off"`, `"optional"`, `"required"`. |
+| `cwd_allowed_roots` | string[] | `[]` | Absolute roots allowed for explicit cwd routing. Empty means only `working_dir` is allowed. |
+| `cwd_create_missing` | bool | `false` | Whether missing explicit cwd paths may be created under an allowed root. |
 
 ---
 

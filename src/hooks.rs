@@ -111,9 +111,10 @@ fn write_temp_script(name: &str, content: &str) -> anyhow::Result<PathBuf> {
 
     let mut f = builder.tempfile()?;
     f.write_all(content.as_bytes())?;
-    let path = f.into_temp_path().keep().map_err(|e| {
-        anyhow::anyhow!("failed to persist temp script: {}", e.error)
-    })?;
+    let path = f
+        .into_temp_path()
+        .keep()
+        .map_err(|e| anyhow::anyhow!("failed to persist temp script: {}", e.error))?;
     Ok(path)
 }
 
@@ -128,9 +129,7 @@ async fn fetch_and_verify(url: &str, expected_hex: &str) -> anyhow::Result<Strin
     }
     let content_length = resp.content_length().unwrap_or(0) as usize;
     if content_length > MAX_SCRIPT_SIZE {
-        anyhow::bail!(
-            "hook script too large: {content_length} bytes (max {MAX_SCRIPT_SIZE})"
-        );
+        anyhow::bail!("hook script too large: {content_length} bytes (max {MAX_SCRIPT_SIZE})");
     }
     let body = resp.bytes().await?;
     if body.len() > MAX_SCRIPT_SIZE {

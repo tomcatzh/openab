@@ -366,12 +366,65 @@ pub struct AgentConfig {
     pub inherit_env: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CwdDirectiveMode {
+    Off,
+    Optional,
+    Required,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CwdDirectiveRequest {
+    Existing(String),
+    Create(String),
+}
+
+impl CwdDirectiveRequest {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Existing(path) | Self::Create(path) => path,
+        }
+    }
+
+    pub fn creates_missing(&self) -> bool {
+        matches!(self, Self::Create(_))
+    }
+
+    pub fn prefer_create(self, other: Self) -> anyhow::Result<Self> {
+        if self.path() != other.path() {
+            return Err(anyhow::anyhow!(
+                "conflicting cwd directives in one batch; start a new thread with one cwd"
+            ));
+        }
+        if self.creates_missing() || other.creates_missing() {
+            Ok(Self::Create(self.path().to_string()))
+        } else {
+            Ok(self)
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PoolConfig {
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
     #[serde(default = "default_ttl_hours")]
     pub session_ttl_hours: u64,
+    /// When true, each thread gets its own working directory under
+    /// `<working_dir>/sessions/<thread_key>/`.
+    /// Kept aligned with upstream PR #41 naming.
+    #[serde(default)]
+    pub per_thread_workdir: bool,
+    /// Controls first-message cwd routing via `[cwd:/path]` or `[[cwd:/path]]`.
+    #[serde(default = "default_cwd_directive")]
+    pub cwd_directive: CwdDirectiveMode,
+    /// Absolute roots allowed for explicit cwd routing.
+    #[serde(default)]
+    pub cwd_allowed_roots: Vec<String>,
+    /// Whether missing explicit cwd paths may be created under an allowed root.
+    #[serde(default)]
+    pub cwd_create_missing: bool,
     /// Hard ceiling for a single prompt (#732). Once exceeded, the broker
     /// abandons the in-flight request, sends `session/cancel` to the agent,
     /// and clears the pending entry so late responses cannot leak into the
@@ -523,6 +576,9 @@ fn default_max_sessions() -> usize {
 fn default_ttl_hours() -> u64 {
     4
 }
+fn default_cwd_directive() -> CwdDirectiveMode {
+    CwdDirectiveMode::Off
+}
 pub(crate) fn default_prompt_hard_timeout_secs() -> u64 {
     30 * 60
 }
@@ -576,6 +632,10 @@ impl Default for PoolConfig {
         Self {
             max_sessions: default_max_sessions(),
             session_ttl_hours: default_ttl_hours(),
+            per_thread_workdir: false,
+            cwd_directive: default_cwd_directive(),
+            cwd_allowed_roots: Vec::new(),
+            cwd_create_missing: false,
             prompt_hard_timeout_secs: default_prompt_hard_timeout_secs(),
             liveness_check_secs: default_liveness_check_secs(),
         }

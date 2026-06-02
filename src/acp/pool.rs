@@ -1,9 +1,9 @@
 use crate::acp::connection::AcpConnection;
 use crate::acp::protocol::ConfigOption;
-use crate::config::AgentConfig;
+use crate::config::{AgentConfig, CwdDirectiveMode, CwdDirectiveRequest};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
@@ -25,6 +25,10 @@ struct PoolState {
     /// Includes both suspended sessions and active sessions so a process restart
     /// can recover any live thread via `session/load`.
     persisted: HashMap<String, String>,
+    /// Persisted project working directories: thread_key → cwd.
+    /// This is intentionally separate from `persisted` so rolling back to
+    /// stock OpenAB leaves the original thread/session map untouched.
+    workdirs: HashMap<String, String>,
     /// Serializes create/resume work per thread so rapid same-thread requests
     /// cannot race each other into duplicate `session/load` attempts.
     creating: HashMap<String, Arc<Mutex<()>>>,
@@ -35,6 +39,11 @@ pub struct SessionPool {
     config: AgentConfig,
     max_sessions: usize,
     mapping_path: PathBuf,
+    workdir_mapping_path: PathBuf,
+    per_thread_workdir: bool,
+    cwd_directive: CwdDirectiveMode,
+    cwd_allowed_roots: Vec<String>,
+    cwd_create_missing: bool,
 }
 
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
@@ -61,26 +70,45 @@ fn get_or_insert_gate(map: &mut HashMap<String, Arc<Mutex<()>>>, key: &str) -> A
 }
 
 impl SessionPool {
-    pub fn new(config: AgentConfig, max_sessions: usize) -> Self {
+    pub fn new(
+        config: AgentConfig,
+        max_sessions: usize,
+        per_thread_workdir: bool,
+        cwd_directive: CwdDirectiveMode,
+        cwd_allowed_roots: Vec<String>,
+        cwd_create_missing: bool,
+    ) -> Self {
         let openab_dir = std::env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/tmp"))
             .join(".openab");
         let _ = std::fs::create_dir_all(&openab_dir);
         let mapping_path = openab_dir.join("thread_map.json");
+        let workdir_mapping_path = openab_dir.join("thread_workdir_map.json");
         let suspended = Self::load_mapping(&mapping_path);
+        let workdirs = Self::load_mapping(&workdir_mapping_path);
         Self {
             state: RwLock::new(PoolState {
                 active: HashMap::new(),
                 cancel_handles: HashMap::new(),
                 persisted: suspended.clone(),
                 suspended,
+                workdirs,
                 creating: HashMap::new(),
             }),
             config,
             max_sessions,
             mapping_path,
+            workdir_mapping_path,
+            per_thread_workdir,
+            cwd_directive,
+            cwd_allowed_roots,
+            cwd_create_missing,
         }
+    }
+
+    pub fn cwd_directive_mode(&self) -> CwdDirectiveMode {
+        self.cwd_directive
     }
 
     fn load_mapping(path: &Path) -> HashMap<String, String> {
@@ -94,6 +122,14 @@ impl SessionPool {
     }
 
     fn save_mapping(&self, persisted: &HashMap<String, String>) {
+        Self::save_mapping_at(&self.mapping_path, persisted);
+    }
+
+    fn save_workdir_mapping(&self, workdirs: &HashMap<String, String>) {
+        Self::save_mapping_at(&self.workdir_mapping_path, workdirs);
+    }
+
+    fn save_mapping_at(path: &Path, persisted: &HashMap<String, String>) {
         let data = match serde_json::to_string_pretty(persisted) {
             Ok(d) => d,
             Err(e) => {
@@ -101,20 +137,165 @@ impl SessionPool {
                 return;
             }
         };
-        let tmp = self.mapping_path.with_extension("json.tmp");
-        if let Err(e) =
-            std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &self.mapping_path))
-        {
-            warn!(path = %self.mapping_path.display(), error = %e, "failed to persist thread mapping");
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, path)) {
+            warn!(path = %path.display(), error = %e, "failed to persist thread mapping");
         }
     }
 
-    pub async fn get_or_create(&self, thread_id: &str) -> Result<()> {
+    fn safe_thread_component(thread_id: &str) -> Result<String> {
+        let mut out = String::with_capacity(thread_id.len());
+        for b in thread_id.bytes() {
+            match b {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' => out.push(b as char),
+                _ => out.push_str(&format!("_{b:02x}")),
+            }
+        }
+        if out.is_empty() || out == "." || out == ".." {
+            return Err(anyhow!("invalid thread_id: {thread_id}"));
+        }
+        Ok(out)
+    }
+
+    fn has_unsafe_components(path: &Path) -> bool {
+        path.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::CurDir | Component::Prefix(_)
+            )
+        })
+    }
+
+    fn allowed_roots(&self) -> Vec<PathBuf> {
+        if self.cwd_allowed_roots.is_empty() {
+            vec![PathBuf::from(&self.config.working_dir)]
+        } else {
+            self.cwd_allowed_roots.iter().map(PathBuf::from).collect()
+        }
+    }
+
+    fn path_under_allowed_root(&self, path: &Path) -> bool {
+        self.allowed_roots()
+            .iter()
+            .any(|root| path.starts_with(root))
+    }
+
+    fn validate_requested_cwd(&self, request: &CwdDirectiveRequest) -> Result<String> {
+        let raw = request.path();
+        let requested = PathBuf::from(raw.trim());
+        if !requested.is_absolute() {
+            return Err(anyhow!("cwd directive must use an absolute path"));
+        }
+        if Self::has_unsafe_components(&requested) {
+            return Err(anyhow!("cwd directive contains unsafe path components"));
+        }
+
+        if requested.exists() {
+            let canonical = std::fs::canonicalize(&requested)
+                .map_err(|e| anyhow!("failed to resolve cwd {}: {e}", requested.display()))?;
+            for root in self.allowed_roots() {
+                let root = std::fs::canonicalize(&root).map_err(|e| {
+                    anyhow!("failed to resolve allowed cwd root {}: {e}", root.display())
+                })?;
+                if canonical.starts_with(&root) {
+                    return Ok(canonical.to_string_lossy().to_string());
+                }
+            }
+            return Err(anyhow!("cwd is outside allowed roots"));
+        }
+
+        if !request.creates_missing() {
+            return Err(anyhow!(
+                "cwd does not exist: {}; use [mkd:/workspace/<project>] to create a new directory",
+                requested.display()
+            ));
+        }
+        if !self.cwd_create_missing {
+            return Err(anyhow!("cwd creation is disabled for this agent"));
+        }
+        if !self.path_under_allowed_root(&requested) {
+            return Err(anyhow!("cwd is outside allowed roots"));
+        }
+
+        std::fs::create_dir_all(&requested)
+            .map_err(|e| anyhow!("failed to create cwd {}: {e}", requested.display()))?;
+        self.validate_requested_cwd(&CwdDirectiveRequest::Existing(raw.to_string()))
+    }
+
+    async fn resolve_working_dir(
+        &self,
+        thread_id: &str,
+        cwd_request: Option<&CwdDirectiveRequest>,
+    ) -> Result<String> {
+        if self.cwd_directive == CwdDirectiveMode::Off {
+            if cwd_request.is_some() {
+                return Err(anyhow!("cwd directives are disabled for this agent"));
+            }
+        } else {
+            let existing_workdir = {
+                let state = self.state.read().await;
+                state.workdirs.get(thread_id).cloned()
+            };
+
+            if let Some(existing) = existing_workdir {
+                if let Some(requested) = cwd_request {
+                    let requested = self.validate_requested_cwd(requested)?;
+                    if requested != existing {
+                        return Err(anyhow!(
+                            "thread already bound to cwd {existing}; start a new thread for {requested}"
+                        ));
+                    }
+                }
+                return Ok(existing);
+            }
+
+            if let Some(requested) = cwd_request {
+                let cwd = self.validate_requested_cwd(requested)?;
+                let mut state = self.state.write().await;
+                if let Some(existing) = state.workdirs.get(thread_id) {
+                    if existing != &cwd {
+                        return Err(anyhow!(
+                            "thread already bound to cwd {existing}; start a new thread for {cwd}"
+                        ));
+                    }
+                    return Ok(existing.clone());
+                }
+                state.workdirs.insert(thread_id.to_string(), cwd.clone());
+                self.save_workdir_mapping(&state.workdirs);
+                info!(thread_id, working_dir = %cwd, "bound thread cwd");
+                return Ok(cwd);
+            }
+
+            if self.cwd_directive == CwdDirectiveMode::Required {
+                return Err(anyhow!(
+                    "missing cwd directive; start the thread with [cwd:/workspace/<project>] for an existing project or [mkd:/workspace/<project>] to create one"
+                ));
+            }
+        }
+
+        if self.per_thread_workdir {
+            let safe = Self::safe_thread_component(thread_id)?;
+            let dir = PathBuf::from(&self.config.working_dir)
+                .join("sessions")
+                .join(safe);
+            tokio::fs::create_dir_all(&dir).await?;
+            return Ok(dir.to_string_lossy().to_string());
+        }
+
+        Ok(self.config.working_dir.clone())
+    }
+
+    pub async fn get_or_create(
+        &self,
+        thread_id: &str,
+        cwd_request: Option<&CwdDirectiveRequest>,
+    ) -> Result<()> {
         let create_gate = {
             let mut state = self.state.write().await;
             get_or_insert_gate(&mut state.creating, thread_id)
         };
         let _create_guard = create_gate.lock().await;
+        let working_dir = self.resolve_working_dir(thread_id, cwd_request).await?;
 
         let (existing, saved_session_id) = {
             let state = self.state.read().await;
@@ -174,7 +355,7 @@ impl SessionPool {
         let mut new_conn = AcpConnection::spawn(
             &self.config.command,
             &self.config.args,
-            &self.config.working_dir,
+            &working_dir,
             &self.config.env,
             &self.config.inherit_env,
         )
@@ -185,7 +366,7 @@ impl SessionPool {
         let mut resumed = false;
         if let Some(ref sid) = saved_session_id {
             if new_conn.supports_load_session {
-                match new_conn.session_load(sid, &self.config.working_dir).await {
+                match new_conn.session_load(sid, &working_dir).await {
                     Ok(()) => {
                         info!(thread_id, session_id = %sid, "session resumed via session/load");
                         resumed = true;
@@ -198,7 +379,7 @@ impl SessionPool {
         }
 
         if !resumed {
-            new_conn.session_new(&self.config.working_dir).await?;
+            new_conn.session_new(&working_dir).await?;
             // Surface the reset banner both for restored sessions and for stale
             // live entries that died before we could recover a resumable
             // session id. In both cases the caller is continuing after an
@@ -477,9 +658,11 @@ impl SessionPool {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_or_insert_gate, remove_if_same_handle};
+    use super::{get_or_insert_gate, remove_if_same_handle, SessionPool};
+    use crate::config::{AgentConfig, CwdDirectiveMode, CwdDirectiveRequest};
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::Mutex;
 
     #[test]
@@ -521,17 +704,116 @@ mod tests {
     fn persisted_mapping_can_include_active_and_suspended_sessions() {
         let persisted = HashMap::from([
             ("active-thread".to_string(), "session-active".to_string()),
-            ("suspended-thread".to_string(), "session-suspended".to_string()),
+            (
+                "suspended-thread".to_string(),
+                "session-suspended".to_string(),
+            ),
         ]);
 
-        let serialized = serde_json::to_string_pretty(&persisted).expect("serialize persisted mapping");
+        let serialized =
+            serde_json::to_string_pretty(&persisted).expect("serialize persisted mapping");
         let roundtrip: HashMap<String, String> =
             serde_json::from_str(&serialized).expect("deserialize persisted mapping");
 
-        assert_eq!(roundtrip.get("active-thread"), Some(&"session-active".to_string()));
+        assert_eq!(
+            roundtrip.get("active-thread"),
+            Some(&"session-active".to_string())
+        );
         assert_eq!(
             roundtrip.get("suspended-thread"),
             Some(&"session-suspended".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_working_dir_binds_required_mkd_without_rwlock_deadlock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project_dir = tmp.path().join("project");
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(&home_dir).expect("home dir");
+
+        let previous_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home_dir);
+
+        let pool = SessionPool::new(
+            AgentConfig {
+                command: "sh".to_string(),
+                args: vec!["-lc".to_string(), "cat".to_string()],
+                working_dir: tmp.path().to_string_lossy().to_string(),
+                env: HashMap::new(),
+                inherit_env: Vec::new(),
+            },
+            1,
+            false,
+            CwdDirectiveMode::Required,
+            vec![tmp.path().to_string_lossy().to_string()],
+            true,
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            pool.resolve_working_dir(
+                "discord:test-thread",
+                Some(&CwdDirectiveRequest::Create(
+                    project_dir.to_string_lossy().to_string(),
+                )),
+            ),
+        )
+        .await
+        .expect("resolve_working_dir should not deadlock")
+        .expect("cwd should resolve");
+
+        let expected = project_dir.canonicalize().expect("canonical project dir");
+        assert_eq!(result, expected.to_string_lossy());
+
+        if let Some(home) = previous_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_working_dir_rejects_missing_cwd_without_mkd() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project_dir = tmp.path().join("missing-project");
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(&home_dir).expect("home dir");
+
+        let previous_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home_dir);
+
+        let pool = SessionPool::new(
+            AgentConfig {
+                command: "sh".to_string(),
+                args: vec!["-lc".to_string(), "cat".to_string()],
+                working_dir: tmp.path().to_string_lossy().to_string(),
+                env: HashMap::new(),
+                inherit_env: Vec::new(),
+            },
+            1,
+            false,
+            CwdDirectiveMode::Required,
+            vec![tmp.path().to_string_lossy().to_string()],
+            true,
+        );
+
+        let err = pool
+            .resolve_working_dir(
+                "discord:test-thread",
+                Some(&CwdDirectiveRequest::Existing(
+                    project_dir.to_string_lossy().to_string(),
+                )),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("use [mkd:/workspace/<project>]"));
+        assert!(!project_dir.exists());
+
+        if let Some(home) = previous_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 }

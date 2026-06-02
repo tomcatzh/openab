@@ -1092,9 +1092,7 @@ async fn handle_message(
                         warn!(filename, error = %e, "image post-processing failed");
                         failed_image_files.push(filename.to_string());
                     }
-                    Err(media::MediaFetchError::HttpStatus(status))
-                        if status.is_client_error() =>
-                    {
+                    Err(media::MediaFetchError::HttpStatus(status)) if status.is_client_error() => {
                         warn!(filename, %status, "image download denied");
                         failed_image_files.push(filename.to_string());
                     }
@@ -1214,6 +1212,7 @@ async fn handle_message(
         sender_json,
         sender_name: sender.sender_name.clone(),
         prompt,
+        cwd_request: None,
         extra_blocks,
         trigger_msg,
         arrived_at: std::time::Instant::now(),
@@ -1292,7 +1291,10 @@ fn strip_mime_params(mimetype: &str) -> &str {
 /// mrkdwn delimiters; without escaping, `<!here>` or `` `<@U123>` `` would render
 /// as mentions or @-here pings.
 pub(crate) fn sanitize_slack_filename(s: &str) -> String {
-    s.replace('&', "&amp;").replace('`', "'").replace('<', "(").replace('>', ")")
+    s.replace('&', "&amp;")
+        .replace('`', "'")
+        .replace('<', "(")
+        .replace('>', ")")
 }
 
 /// Returns `true` if `text` contains a Slack user mention for `uid`.
@@ -1303,8 +1305,12 @@ pub(crate) fn sanitize_slack_filename(s: &str) -> String {
 /// misses it.
 fn text_mentions_uid(text: &str, uid: &str) -> bool {
     let prefix = format!("<@{uid}");
-    text.match_indices(&prefix)
-        .any(|(i, _)| matches!(text.as_bytes().get(i + prefix.len()), Some(b'>') | Some(b'|')))
+    text.match_indices(&prefix).any(|(i, _)| {
+        matches!(
+            text.as_bytes().get(i + prefix.len()),
+            Some(b'>') | Some(b'|')
+        )
+    })
 }
 
 fn bot_id_matches_trusted(
@@ -1457,7 +1463,10 @@ mod tests {
 
     #[test]
     fn mentions_uid_labelled_form_mid_sentence() {
-        assert!(text_mentions_uid("please ask <@U123BOT|handle> to run", "U123BOT"));
+        assert!(text_mentions_uid(
+            "please ask <@U123BOT|handle> to run",
+            "U123BOT"
+        ));
     }
 
     #[test]
@@ -1575,7 +1584,10 @@ mod tests {
     #[test]
     fn sanitize_leaves_normal_filename_unchanged() {
         assert_eq!(sanitize_slack_filename("photo.png"), "photo.png");
-        assert_eq!(sanitize_slack_filename("my file (1).jpg"), "my file (1).jpg");
+        assert_eq!(
+            sanitize_slack_filename("my file (1).jpg"),
+            "my file (1).jpg"
+        );
     }
 
     #[test]
@@ -1593,10 +1605,7 @@ mod tests {
     #[test]
     fn sanitize_combined_injection_attempt() {
         // A filename constructed to inject a Slack @here ping.
-        assert_eq!(
-            sanitize_slack_filename("`<!here>`"),
-            "'(!here)'"
-        );
+        assert_eq!(sanitize_slack_filename("`<!here>`"), "'(!here)'");
     }
 
     #[test]
@@ -1605,8 +1614,14 @@ mod tests {
         // "&lt;@here&gt;" would round-trip back to "<@here>" and trigger a mention
         // ping if & is not escaped. The & must be escaped first so downstream
         // Slack entity decoding cannot reconstruct a mrkdwn delimiter.
-        assert_eq!(sanitize_slack_filename("&lt;@here&gt;"), "&amp;lt;@here&amp;gt;");
-        assert_eq!(sanitize_slack_filename("file&name.png"), "file&amp;name.png");
+        assert_eq!(
+            sanitize_slack_filename("&lt;@here&gt;"),
+            "&amp;lt;@here&amp;gt;"
+        );
+        assert_eq!(
+            sanitize_slack_filename("file&name.png"),
+            "file&amp;name.png"
+        );
     }
 
     // --- strip_mime_params tests ---
@@ -1646,11 +1661,7 @@ mod tests {
     #[test]
     fn trusted_bot_ids_accepts_resolved_bot_user_id() {
         let trusted = HashSet::from(["U123BOT".to_string()]);
-        assert!(bot_id_matches_trusted(
-            &trusted,
-            "B123BOT",
-            Some("U123BOT")
-        ));
+        assert!(bot_id_matches_trusted(&trusted, "B123BOT", Some("U123BOT")));
     }
 
     #[test]

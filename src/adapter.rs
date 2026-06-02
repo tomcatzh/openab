@@ -1,11 +1,11 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::Serialize;
 use std::sync::Arc;
 use tracing::{error, warn};
 
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
-use crate::config::{ReactionsConfig, ToolDisplay};
+use crate::config::{CwdDirectiveRequest, ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::markdown::{self, TableMode};
@@ -39,7 +39,12 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                         "reply_to" => {
                             let v = value.trim();
                             // Validate: non-empty, reasonable length, no whitespace/control chars
-                            if !v.is_empty() && v.len() <= 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') {
+                            if !v.is_empty()
+                                && v.len() <= 64
+                                && v.chars().all(|c| {
+                                    c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+                                })
+                            {
                                 directives.reply_to = Some(v.to_string());
                             }
                         }
@@ -346,6 +351,46 @@ impl AdapterRouter {
         blocks
     }
 
+    /// Extract a leading project cwd directive from user-visible prompt text.
+    /// `[cwd:/path]` selects an existing directory. `[mkd:/path]` explicitly
+    /// creates a missing directory when the agent allows cwd creation.
+    /// Double-bracket forms (`[[cwd:/path]]`, `[[mkd:/path]]`) are also
+    /// accepted for this deployment's explicit marker style.
+    pub fn extract_cwd_directive(prompt: &str) -> Result<(Option<CwdDirectiveRequest>, String)> {
+        let trimmed = prompt.trim_start();
+        let leading_len = prompt.len() - trimmed.len();
+
+        let forms = [
+            ("[[cwd:", "]]", false),
+            ("[cwd:", "]", false),
+            ("[[mkd:", "]]", true),
+            ("[mkd:", "]", true),
+        ];
+        for (open, close, create_missing) in forms {
+            if let Some(after_open) = trimmed.strip_prefix(open) {
+                let Some(close_idx) = after_open.find(close) else {
+                    return Err(anyhow!("unterminated cwd/mkd directive"));
+                };
+                let cwd = after_open[..close_idx].trim();
+                if cwd.is_empty() {
+                    return Err(anyhow!("empty cwd/mkd directive"));
+                }
+                let rest = after_open[close_idx + close.len()..].trim_start();
+                let mut cleaned = String::new();
+                cleaned.push_str(&prompt[..leading_len]);
+                cleaned.push_str(rest);
+                let request = if create_missing {
+                    CwdDirectiveRequest::Create(cwd.to_string())
+                } else {
+                    CwdDirectiveRequest::Existing(cwd.to_string())
+                };
+                return Ok((Some(request), cleaned));
+            }
+        }
+
+        Ok((None, prompt.to_string()))
+    }
+
     /// Handle an incoming user message. The adapter is responsible for
     /// filtering, resolving the thread, and building the SenderContext.
     /// This method handles sender context injection, session management, and streaming.
@@ -356,8 +401,8 @@ impl AdapterRouter {
     ) -> Result<()> {
         tracing::debug!(platform = adapter.platform(), "processing message");
 
-        let content_blocks =
-            Self::pack_arrival_event(&ctx.sender_json, &ctx.prompt, ctx.extra_blocks);
+        let (cwd_request, prompt) = Self::extract_cwd_directive(&ctx.prompt)?;
+        let content_blocks = Self::pack_arrival_event(&ctx.sender_json, &prompt, ctx.extra_blocks);
 
         let thread_key = format!(
             "{}:{}",
@@ -368,7 +413,11 @@ impl AdapterRouter {
                 .unwrap_or(&ctx.thread_channel.channel_id)
         );
 
-        if let Err(e) = self.pool.get_or_create(&thread_key).await {
+        if let Err(e) = self
+            .pool
+            .get_or_create(&thread_key, cwd_request.as_ref())
+            .await
+        {
             let msg = format_user_error(&e.to_string());
             let _ = adapter
                 .send_message(&ctx.thread_channel, &format!("⚠️ {msg}"))
@@ -1043,7 +1092,9 @@ mod tests {
 
 #[cfg(test)]
 mod directive_tests {
-    use super::parse_output_directives;
+    use crate::config::CwdDirectiveRequest;
+
+    use super::{parse_output_directives, AdapterRouter};
 
     #[test]
     fn parse_reply_to_directive() {
@@ -1194,5 +1245,63 @@ mod directive_tests {
         let (directives, content) = parse_output_directives(input);
         assert_eq!(directives.reply_to, Some("456".to_string()));
         assert_eq!(content, "看看 [[這個]] 怎麼樣");
+    }
+
+    #[test]
+    fn extract_cwd_directive_double_bracket() {
+        let (cwd, content) =
+            AdapterRouter::extract_cwd_directive("[[cwd:/workspace/foo]]  do work").unwrap();
+        assert_eq!(
+            cwd,
+            Some(CwdDirectiveRequest::Existing("/workspace/foo".to_string()))
+        );
+        assert_eq!(content, "do work");
+    }
+
+    #[test]
+    fn extract_cwd_directive_single_bracket() {
+        let (cwd, content) =
+            AdapterRouter::extract_cwd_directive("[cwd:/workspace/foo]\ndo work").unwrap();
+        assert_eq!(
+            cwd,
+            Some(CwdDirectiveRequest::Existing("/workspace/foo".to_string()))
+        );
+        assert_eq!(content, "do work");
+    }
+
+    #[test]
+    fn extract_mkd_directive_double_bracket() {
+        let (cwd, content) =
+            AdapterRouter::extract_cwd_directive("[[mkd:/workspace/foo]]  do work").unwrap();
+        assert_eq!(
+            cwd,
+            Some(CwdDirectiveRequest::Create("/workspace/foo".to_string()))
+        );
+        assert_eq!(content, "do work");
+    }
+
+    #[test]
+    fn extract_mkd_directive_single_bracket() {
+        let (cwd, content) =
+            AdapterRouter::extract_cwd_directive("[mkd:/workspace/foo]\ndo work").unwrap();
+        assert_eq!(
+            cwd,
+            Some(CwdDirectiveRequest::Create("/workspace/foo".to_string()))
+        );
+        assert_eq!(content, "do work");
+    }
+
+    #[test]
+    fn extract_cwd_directive_absent_preserves_prompt() {
+        let input = "do work in /workspace/foo";
+        let (cwd, content) = AdapterRouter::extract_cwd_directive(input).unwrap();
+        assert_eq!(cwd, None);
+        assert_eq!(content, input);
+    }
+
+    #[test]
+    fn extract_cwd_directive_rejects_unterminated() {
+        let err = AdapterRouter::extract_cwd_directive("[[cwd:/workspace/foo").unwrap_err();
+        assert!(err.to_string().contains("unterminated cwd/mkd directive"));
     }
 }
