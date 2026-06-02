@@ -673,7 +673,7 @@ impl EventHandler for Handler {
             return;
         }
 
-        let (cwd_request, prompt) = match AdapterRouter::extract_cwd_directive(&prompt) {
+        let (mut cwd_request, prompt) = match AdapterRouter::extract_cwd_directive(&prompt) {
             Ok(parsed) => parsed,
             Err(e) => {
                 let ch = ChannelRef {
@@ -702,27 +702,19 @@ impl EventHandler for Handler {
                 parent_id: None,
                 origin_event_id: None,
             };
-            match (cwd_mode, cwd_request.as_ref()) {
-                (CwdDirectiveMode::Required, None) => {
-                    let _ = adapter
-                        .send_message(
-                            &ch,
-                            "⚠️ missing cwd directive; start the thread with [cwd:/workspace/<project>] for an existing project or [mkd:/workspace/<project>] to create one",
-                        )
-                        .await;
-                    let _ = adapter.add_reaction(&discord_msg_ref(&msg), "❌").await;
-                    error!("missing cwd directive before thread creation");
-                    return;
+            if matches!(cwd_mode, CwdDirectiveMode::Off | CwdDirectiveMode::Required)
+                || cwd_request.is_some()
+            {
+                match self.dispatcher.prepare_cwd_request(cwd_request.as_ref()) {
+                    Ok(prepared) => cwd_request = prepared,
+                    Err(e) => {
+                        let user_msg = crate::error_display::format_user_error(&e.to_string());
+                        let _ = adapter.send_message(&ch, &format!("⚠️ {user_msg}")).await;
+                        let _ = adapter.add_reaction(&discord_msg_ref(&msg), "❌").await;
+                        error!("cwd directive preflight failed before thread creation: {e}");
+                        return;
+                    }
                 }
-                (CwdDirectiveMode::Off, Some(_)) => {
-                    let _ = adapter
-                        .send_message(&ch, "⚠️ cwd directives are disabled for this agent")
-                        .await;
-                    let _ = adapter.add_reaction(&discord_msg_ref(&msg), "❌").await;
-                    error!("cwd directive supplied while disabled before thread creation");
-                    return;
-                }
-                _ => {}
             }
         }
 

@@ -122,6 +122,15 @@ pub trait DispatchTarget: Send + Sync + 'static {
 
     fn cwd_directive_mode(&self) -> CwdDirectiveMode;
 
+    /// Validate an optional cwd directive before platform resources such as
+    /// Discord threads are created. A successful `[mkd]` is normalised to
+    /// `Existing(canonical_path)` so the later session creation path does not
+    /// try to create it a second time.
+    fn prepare_cwd_request(
+        &self,
+        cwd_request: Option<&CwdDirectiveRequest>,
+    ) -> Result<Option<CwdDirectiveRequest>>;
+
     /// Ensure the ACP session for `session_key` exists (idempotent).
     async fn ensure_session(
         &self,
@@ -150,6 +159,13 @@ impl DispatchTarget for AdapterRouter {
 
     fn cwd_directive_mode(&self) -> CwdDirectiveMode {
         self.pool().cwd_directive_mode()
+    }
+
+    fn prepare_cwd_request(
+        &self,
+        cwd_request: Option<&CwdDirectiveRequest>,
+    ) -> Result<Option<CwdDirectiveRequest>> {
+        self.pool().prepare_cwd_request(cwd_request)
     }
 
     async fn ensure_session(
@@ -286,6 +302,13 @@ impl Dispatcher {
 
     pub fn cwd_directive_mode(&self) -> CwdDirectiveMode {
         self.target.cwd_directive_mode()
+    }
+
+    pub fn prepare_cwd_request(
+        &self,
+        cwd_request: Option<&CwdDirectiveRequest>,
+    ) -> Result<Option<CwdDirectiveRequest>> {
+        self.target.prepare_cwd_request(cwd_request)
     }
 
     /// Build the shared session pool key for a routed channel.
@@ -1354,6 +1377,13 @@ mod tests {
 
         fn cwd_directive_mode(&self) -> CwdDirectiveMode {
             CwdDirectiveMode::Off
+        }
+
+        fn prepare_cwd_request(
+            &self,
+            cwd_request: Option<&CwdDirectiveRequest>,
+        ) -> Result<Option<CwdDirectiveRequest>> {
+            Ok(cwd_request.cloned())
         }
 
         async fn ensure_session(

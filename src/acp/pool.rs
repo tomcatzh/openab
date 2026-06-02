@@ -180,6 +180,23 @@ impl SessionPool {
             .any(|root| path.starts_with(root))
     }
 
+    fn validate_existing_cwd_path(&self, requested: &Path) -> Result<String> {
+        if !requested.is_dir() {
+            return Err(anyhow!("cwd is not a directory: {}", requested.display()));
+        }
+        let canonical = std::fs::canonicalize(requested)
+            .map_err(|e| anyhow!("failed to resolve cwd {}: {e}", requested.display()))?;
+        for root in self.allowed_roots() {
+            let root = std::fs::canonicalize(&root).map_err(|e| {
+                anyhow!("failed to resolve allowed cwd root {}: {e}", root.display())
+            })?;
+            if canonical.starts_with(&root) {
+                return Ok(canonical.to_string_lossy().to_string());
+            }
+        }
+        Err(anyhow!("cwd is outside allowed roots"))
+    }
+
     fn validate_requested_cwd(&self, request: &CwdDirectiveRequest) -> Result<String> {
         let raw = request.path();
         let requested = PathBuf::from(raw.trim());
@@ -191,17 +208,13 @@ impl SessionPool {
         }
 
         if requested.exists() {
-            let canonical = std::fs::canonicalize(&requested)
-                .map_err(|e| anyhow!("failed to resolve cwd {}: {e}", requested.display()))?;
-            for root in self.allowed_roots() {
-                let root = std::fs::canonicalize(&root).map_err(|e| {
-                    anyhow!("failed to resolve allowed cwd root {}: {e}", root.display())
-                })?;
-                if canonical.starts_with(&root) {
-                    return Ok(canonical.to_string_lossy().to_string());
-                }
+            if request.creates_missing() {
+                return Err(anyhow!(
+                    "cwd already exists: {}; use [cwd:/workspace/<project>] for an existing directory",
+                    requested.display()
+                ));
             }
-            return Err(anyhow!("cwd is outside allowed roots"));
+            return self.validate_existing_cwd_path(&requested);
         }
 
         if !request.creates_missing() {
@@ -222,6 +235,30 @@ impl SessionPool {
         self.validate_requested_cwd(&CwdDirectiveRequest::Existing(raw.to_string()))
     }
 
+    pub fn prepare_cwd_request(
+        &self,
+        cwd_request: Option<&CwdDirectiveRequest>,
+    ) -> Result<Option<CwdDirectiveRequest>> {
+        if self.cwd_directive == CwdDirectiveMode::Off {
+            if cwd_request.is_some() {
+                return Err(anyhow!("cwd directives are disabled for this agent"));
+            }
+            return Ok(None);
+        }
+
+        let Some(requested) = cwd_request else {
+            if self.cwd_directive == CwdDirectiveMode::Required {
+                return Err(anyhow!(
+                    "missing cwd directive; start the thread with [cwd:/workspace/<project>] for an existing project or [mkd:/workspace/<project>] to create one"
+                ));
+            }
+            return Ok(None);
+        };
+
+        let cwd = self.validate_requested_cwd(requested)?;
+        Ok(Some(CwdDirectiveRequest::Existing(cwd)))
+    }
+
     async fn resolve_working_dir(
         &self,
         thread_id: &str,
@@ -239,7 +276,12 @@ impl SessionPool {
 
             if let Some(existing) = existing_workdir {
                 if let Some(requested) = cwd_request {
-                    let requested = self.validate_requested_cwd(requested)?;
+                    let requested = self.prepare_cwd_request(Some(requested))?;
+                    let requested = requested
+                        .as_ref()
+                        .expect("Some request should stay Some")
+                        .path()
+                        .to_string();
                     if requested != existing {
                         return Err(anyhow!(
                             "thread already bound to cwd {existing}; start a new thread for {requested}"
@@ -250,7 +292,12 @@ impl SessionPool {
             }
 
             if let Some(requested) = cwd_request {
-                let cwd = self.validate_requested_cwd(requested)?;
+                let prepared = self.prepare_cwd_request(Some(requested))?;
+                let cwd = prepared
+                    .as_ref()
+                    .expect("Some request should stay Some")
+                    .path()
+                    .to_string();
                 let mut state = self.state.write().await;
                 if let Some(existing) = state.workdirs.get(thread_id) {
                     if existing != &cwd {
@@ -809,6 +856,93 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("use [mkd:/workspace/<project>]"));
         assert!(!project_dir.exists());
+
+        if let Some(home) = previous_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn prepare_cwd_request_creates_mkd_then_normalizes_to_existing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project_dir = tmp.path().join("project");
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(&home_dir).expect("home dir");
+
+        let previous_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home_dir);
+
+        let pool = SessionPool::new(
+            AgentConfig {
+                command: "sh".to_string(),
+                args: vec!["-lc".to_string(), "cat".to_string()],
+                working_dir: tmp.path().to_string_lossy().to_string(),
+                env: HashMap::new(),
+                inherit_env: Vec::new(),
+            },
+            1,
+            false,
+            CwdDirectiveMode::Required,
+            vec![tmp.path().to_string_lossy().to_string()],
+            true,
+        );
+
+        let prepared = pool
+            .prepare_cwd_request(Some(&CwdDirectiveRequest::Create(
+                project_dir.to_string_lossy().to_string(),
+            )))
+            .expect("mkd should create and normalize")
+            .expect("request should stay present");
+
+        let expected = project_dir.canonicalize().expect("canonical project dir");
+        assert_eq!(
+            prepared,
+            CwdDirectiveRequest::Existing(expected.to_string_lossy().to_string())
+        );
+
+        if let Some(home) = previous_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn prepare_cwd_request_rejects_existing_mkd() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project_dir = tmp.path().join("project");
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        std::fs::create_dir_all(&home_dir).expect("home dir");
+
+        let previous_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home_dir);
+
+        let pool = SessionPool::new(
+            AgentConfig {
+                command: "sh".to_string(),
+                args: vec!["-lc".to_string(), "cat".to_string()],
+                working_dir: tmp.path().to_string_lossy().to_string(),
+                env: HashMap::new(),
+                inherit_env: Vec::new(),
+            },
+            1,
+            false,
+            CwdDirectiveMode::Required,
+            vec![tmp.path().to_string_lossy().to_string()],
+            true,
+        );
+
+        let err = pool
+            .prepare_cwd_request(Some(&CwdDirectiveRequest::Create(
+                project_dir.to_string_lossy().to_string(),
+            )))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("cwd already exists"));
+        assert!(err.to_string().contains("use [cwd:/workspace/<project>]"));
 
         if let Some(home) = previous_home {
             std::env::set_var("HOME", home);
