@@ -122,8 +122,8 @@ pub trait DispatchTarget: Send + Sync + 'static {
 
     /// Validate an optional workspace directive before platform resources such
     /// as Discord threads are created. A successful `--create` is normalised to
-    /// `Existing(canonical_path)` so later session creation does not create it
-    /// a second time.
+    /// `Existing(relative_name)` so later session creation treats it as an
+    /// existing workspace while still resolving the final cwd itself.
     fn prepare_workspace_request(
         &self,
         workspace_request: Option<&WorkspaceRequest>,

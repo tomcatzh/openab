@@ -276,8 +276,10 @@ impl SessionPool {
             return Ok(None);
         };
 
-        let workspace = self.validate_requested_workspace(requested)?;
-        Ok(Some(WorkspaceRequest::Existing(workspace)))
+        let rel = Self::validate_workspace_name(requested.name())?;
+        let workspace_name = rel.to_string_lossy().to_string();
+        self.validate_requested_workspace(requested)?;
+        Ok(Some(WorkspaceRequest::Existing(workspace_name)))
     }
 
     async fn resolve_working_dir(
@@ -301,12 +303,7 @@ impl SessionPool {
             }
 
             if let Some(requested) = workspace_request {
-                let prepared = self.prepare_workspace_request(Some(requested))?;
-                let cwd = prepared
-                    .as_ref()
-                    .expect("Some request should stay Some")
-                    .name()
-                    .to_string();
+                let cwd = self.validate_requested_workspace(requested)?;
                 let mut state = self.state.write().await;
                 if let Some(existing) = state.workdirs.get(thread_id) {
                     return Err(anyhow!(
@@ -875,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_workspace_request_creates_then_normalizes_to_existing() {
+    fn prepare_workspace_request_creates_then_normalizes_to_existing_relative_name() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().join("workspaces");
         let project_dir = root.join("project");
@@ -897,11 +894,45 @@ mod tests {
             .expect("workspace should create and normalize")
             .expect("request should stay present");
 
-        let expected = project_dir.canonicalize().expect("canonical project dir");
+        assert!(project_dir.is_dir());
+        assert_eq!(prepared, WorkspaceRequest::Existing("project".to_string()));
+    }
+
+    #[tokio::test]
+    async fn preflighted_existing_workspace_resolves_to_canonical_cwd() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspaces");
+        let project_dir = root.join("openab-lab");
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        std::fs::create_dir_all(&home_dir).expect("home dir");
+
+        let pool = with_home(&home_dir, || {
+            SessionPool::new(
+                agent_config(tmp.path()),
+                1,
+                false,
+                workspace_config(&root, true),
+            )
+        });
+
+        let prepared = pool
+            .prepare_workspace_request(Some(&WorkspaceRequest::Existing("openab-lab".to_string())))
+            .expect("workspace preflight should resolve")
+            .expect("request should stay present");
+
         assert_eq!(
             prepared,
-            WorkspaceRequest::Existing(expected.to_string_lossy().to_string())
+            WorkspaceRequest::Existing("openab-lab".to_string())
         );
+
+        let cwd = pool
+            .resolve_working_dir("discord:test-thread", Some(&prepared))
+            .await
+            .expect("preflighted workspace should create session cwd");
+
+        let expected = project_dir.canonicalize().expect("canonical project dir");
+        assert_eq!(cwd, expected.to_string_lossy());
     }
 
     #[test]
@@ -995,11 +1026,7 @@ mod tests {
             .expect("nested workspace should resolve")
             .expect("request should stay present");
 
-        let expected = project_dir.canonicalize().expect("canonical project dir");
-        assert_eq!(
-            prepared,
-            WorkspaceRequest::Existing(expected.to_string_lossy().to_string())
-        );
+        assert_eq!(prepared, WorkspaceRequest::Existing("team/foo".to_string()));
     }
 
     #[test]
