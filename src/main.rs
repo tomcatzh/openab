@@ -140,9 +140,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.agent,
         cfg.pool.max_sessions,
         cfg.pool.per_thread_workdir,
-        cfg.pool.cwd_directive,
-        cfg.pool.cwd_allowed_roots.clone(),
-        cfg.pool.cwd_create_missing,
+        cfg.workspace,
     ));
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 

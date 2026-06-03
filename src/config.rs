@@ -74,6 +74,8 @@ pub struct Config {
     #[serde(default)]
     pub pool: PoolConfig,
     #[serde(default)]
+    pub workspace: WorkspaceConfig,
+    #[serde(default)]
     pub reactions: ReactionsConfig,
     #[serde(default)]
     pub stt: SttConfig,
@@ -366,42 +368,21 @@ pub struct AgentConfig {
     pub inherit_env: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum CwdDirectiveMode {
-    Off,
-    Optional,
-    Required,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CwdDirectiveRequest {
+pub enum WorkspaceRequest {
     Existing(String),
     Create(String),
 }
 
-impl CwdDirectiveRequest {
-    pub fn path(&self) -> &str {
+impl WorkspaceRequest {
+    pub fn name(&self) -> &str {
         match self {
-            Self::Existing(path) | Self::Create(path) => path,
+            Self::Existing(name) | Self::Create(name) => name,
         }
     }
 
     pub fn creates_missing(&self) -> bool {
         matches!(self, Self::Create(_))
-    }
-
-    pub fn prefer_create(self, other: Self) -> anyhow::Result<Self> {
-        if self.path() != other.path() {
-            return Err(anyhow::anyhow!(
-                "conflicting cwd directives in one batch; start a new thread with one cwd"
-            ));
-        }
-        if self.creates_missing() || other.creates_missing() {
-            Ok(Self::Create(self.path().to_string()))
-        } else {
-            Ok(self)
-        }
     }
 }
 
@@ -416,15 +397,6 @@ pub struct PoolConfig {
     /// Kept aligned with upstream PR #41 naming.
     #[serde(default)]
     pub per_thread_workdir: bool,
-    /// Controls first-message cwd routing via `[cwd:/path]` or `[[cwd:/path]]`.
-    #[serde(default = "default_cwd_directive")]
-    pub cwd_directive: CwdDirectiveMode,
-    /// Absolute roots allowed for explicit cwd routing.
-    #[serde(default)]
-    pub cwd_allowed_roots: Vec<String>,
-    /// Whether missing explicit cwd paths may be created under an allowed root.
-    #[serde(default)]
-    pub cwd_create_missing: bool,
     /// Hard ceiling for a single prompt (#732). Once exceeded, the broker
     /// abandons the in-flight request, sends `session/cancel` to the agent,
     /// and clears the pending entry so late responses cannot leak into the
@@ -439,6 +411,17 @@ pub struct PoolConfig {
     /// more wakeups while the agent is streaming normally.
     #[serde(default = "default_liveness_check_secs")]
     pub liveness_check_secs: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WorkspaceConfig {
+    /// Container-visible workspace root. The Helm chart maps host
+    /// `workspace.root` to this fixed runtime path.
+    #[serde(default)]
+    pub root: Option<String>,
+    /// When true, the first message for a new session must include `[[ws:...]]`.
+    #[serde(default)]
+    pub required: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -576,9 +559,6 @@ fn default_max_sessions() -> usize {
 fn default_ttl_hours() -> u64 {
     4
 }
-fn default_cwd_directive() -> CwdDirectiveMode {
-    CwdDirectiveMode::Off
-}
 pub(crate) fn default_prompt_hard_timeout_secs() -> u64 {
     30 * 60
 }
@@ -633,9 +613,6 @@ impl Default for PoolConfig {
             max_sessions: default_max_sessions(),
             session_ttl_hours: default_ttl_hours(),
             per_thread_workdir: false,
-            cwd_directive: default_cwd_directive(),
-            cwd_allowed_roots: Vec::new(),
-            cwd_create_missing: false,
             prompt_hard_timeout_secs: default_prompt_hard_timeout_secs(),
             liveness_check_secs: default_liveness_check_secs(),
         }

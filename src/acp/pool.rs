@@ -1,6 +1,6 @@
 use crate::acp::connection::AcpConnection;
 use crate::acp::protocol::ConfigOption;
-use crate::config::{AgentConfig, CwdDirectiveMode, CwdDirectiveRequest};
+use crate::config::{AgentConfig, WorkspaceConfig, WorkspaceRequest};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -41,9 +41,7 @@ pub struct SessionPool {
     mapping_path: PathBuf,
     workdir_mapping_path: PathBuf,
     per_thread_workdir: bool,
-    cwd_directive: CwdDirectiveMode,
-    cwd_allowed_roots: Vec<String>,
-    cwd_create_missing: bool,
+    workspace: WorkspaceConfig,
 }
 
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
@@ -74,9 +72,7 @@ impl SessionPool {
         config: AgentConfig,
         max_sessions: usize,
         per_thread_workdir: bool,
-        cwd_directive: CwdDirectiveMode,
-        cwd_allowed_roots: Vec<String>,
-        cwd_create_missing: bool,
+        workspace: WorkspaceConfig,
     ) -> Self {
         let openab_dir = std::env::var("HOME")
             .map(PathBuf::from)
@@ -101,14 +97,12 @@ impl SessionPool {
             mapping_path,
             workdir_mapping_path,
             per_thread_workdir,
-            cwd_directive,
-            cwd_allowed_roots,
-            cwd_create_missing,
+            workspace,
         }
     }
 
-    pub fn cwd_directive_mode(&self) -> CwdDirectiveMode {
-        self.cwd_directive
+    pub fn workspace_enabled(&self) -> bool {
+        self.workspace.root.is_some()
     }
 
     fn load_mapping(path: &Path) -> HashMap<String, String> {
@@ -166,156 +160,168 @@ impl SessionPool {
         })
     }
 
-    fn allowed_roots(&self) -> Vec<PathBuf> {
-        if self.cwd_allowed_roots.is_empty() {
-            vec![PathBuf::from(&self.config.working_dir)]
-        } else {
-            self.cwd_allowed_roots.iter().map(PathBuf::from).collect()
+    fn workspace_root(&self) -> Option<PathBuf> {
+        self.workspace.root.as_ref().map(PathBuf::from)
+    }
+
+    fn validate_workspace_name(name: &str) -> Result<PathBuf> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("empty workspace directive"));
         }
+        let rel = PathBuf::from(trimmed);
+        if rel.is_absolute() {
+            return Err(anyhow!(
+                "workspace must be a relative path under the workspace root"
+            ));
+        }
+        if Self::has_unsafe_components(&rel) {
+            return Err(anyhow!("workspace contains unsafe path components"));
+        }
+        if rel.as_os_str().is_empty() || trimmed == "." || trimmed == ".." {
+            return Err(anyhow!("invalid workspace path"));
+        }
+        Ok(rel)
     }
 
-    fn path_under_allowed_root(&self, path: &Path) -> bool {
-        self.allowed_roots()
-            .iter()
-            .any(|root| path.starts_with(root))
-    }
-
-    fn validate_existing_cwd_path(&self, requested: &Path) -> Result<String> {
+    fn validate_existing_workspace_path(&self, requested: &Path, root: &Path) -> Result<String> {
         if !requested.is_dir() {
-            return Err(anyhow!("cwd is not a directory: {}", requested.display()));
+            return Err(anyhow!(
+                "workspace is not a directory: {}",
+                requested.display()
+            ));
         }
+        let root = std::fs::canonicalize(root)
+            .map_err(|e| anyhow!("failed to resolve workspace root {}: {e}", root.display()))?;
         let canonical = std::fs::canonicalize(requested)
-            .map_err(|e| anyhow!("failed to resolve cwd {}: {e}", requested.display()))?;
-        for root in self.allowed_roots() {
-            let root = std::fs::canonicalize(&root).map_err(|e| {
-                anyhow!("failed to resolve allowed cwd root {}: {e}", root.display())
-            })?;
-            if canonical.starts_with(&root) {
-                return Ok(canonical.to_string_lossy().to_string());
-            }
+            .map_err(|e| anyhow!("failed to resolve workspace {}: {e}", requested.display()))?;
+        if canonical.starts_with(&root) {
+            return Ok(canonical.to_string_lossy().to_string());
         }
-        Err(anyhow!("cwd is outside allowed roots"))
+        Err(anyhow!("workspace is outside the workspace root"))
     }
 
-    fn validate_requested_cwd(&self, request: &CwdDirectiveRequest) -> Result<String> {
-        let raw = request.path();
-        let requested = PathBuf::from(raw.trim());
-        if !requested.is_absolute() {
-            return Err(anyhow!("cwd directive must use an absolute path"));
+    fn existing_ancestor(path: &Path) -> Option<PathBuf> {
+        let mut current = path.parent();
+        while let Some(candidate) = current {
+            if candidate.exists() {
+                return Some(candidate.to_path_buf());
+            }
+            current = candidate.parent();
         }
-        if Self::has_unsafe_components(&requested) {
-            return Err(anyhow!("cwd directive contains unsafe path components"));
-        }
+        None
+    }
 
+    fn validate_requested_workspace(&self, request: &WorkspaceRequest) -> Result<String> {
+        let Some(root) = self.workspace_root() else {
+            return Ok(self.config.working_dir.clone());
+        };
+        let rel = Self::validate_workspace_name(request.name())?;
+        let requested = root.join(&rel);
+        if !requested.starts_with(&root) {
+            return Err(anyhow!("workspace is outside the workspace root"));
+        }
         if requested.exists() {
             if request.creates_missing() {
                 return Err(anyhow!(
-                    "cwd already exists: {}; use [cwd:/workspace/<project>] for an existing directory",
-                    requested.display()
+                    "workspace already exists: {}; use [[ws:{}]] for an existing workspace",
+                    requested.display(),
+                    request.name()
                 ));
             }
-            return self.validate_existing_cwd_path(&requested);
+            return self.validate_existing_workspace_path(&requested, &root);
         }
 
         if !request.creates_missing() {
             return Err(anyhow!(
-                "cwd does not exist: {}; use [mkd:/workspace/<project>] to create a new directory",
-                requested.display()
+                "workspace does not exist: {}; use [[ws:{} --create]] to create it",
+                requested.display(),
+                request.name()
             ));
         }
-        if !self.cwd_create_missing {
-            return Err(anyhow!("cwd creation is disabled for this agent"));
-        }
-        if !self.path_under_allowed_root(&requested) {
-            return Err(anyhow!("cwd is outside allowed roots"));
+
+        let root_canonical = std::fs::canonicalize(&root)
+            .map_err(|e| anyhow!("failed to resolve workspace root {}: {e}", root.display()))?;
+        let ancestor = Self::existing_ancestor(&requested)
+            .ok_or_else(|| anyhow!("workspace root does not exist: {}", root.display()))?;
+        let ancestor_canonical = std::fs::canonicalize(&ancestor).map_err(|e| {
+            anyhow!(
+                "failed to resolve workspace parent {}: {e}",
+                ancestor.display()
+            )
+        })?;
+        if !ancestor_canonical.starts_with(&root_canonical) {
+            return Err(anyhow!("workspace parent is outside the workspace root"));
         }
 
         std::fs::create_dir_all(&requested)
-            .map_err(|e| anyhow!("failed to create cwd {}: {e}", requested.display()))?;
-        self.validate_requested_cwd(&CwdDirectiveRequest::Existing(raw.to_string()))
+            .map_err(|e| anyhow!("failed to create workspace {}: {e}", requested.display()))?;
+        self.validate_existing_workspace_path(&requested, &root)
     }
 
-    pub fn prepare_cwd_request(
+    pub fn prepare_workspace_request(
         &self,
-        cwd_request: Option<&CwdDirectiveRequest>,
-    ) -> Result<Option<CwdDirectiveRequest>> {
-        if self.cwd_directive == CwdDirectiveMode::Off {
-            if cwd_request.is_some() {
-                return Err(anyhow!("cwd directives are disabled for this agent"));
-            }
+        workspace_request: Option<&WorkspaceRequest>,
+    ) -> Result<Option<WorkspaceRequest>> {
+        if !self.workspace_enabled() {
             return Ok(None);
         }
 
-        let Some(requested) = cwd_request else {
-            if self.cwd_directive == CwdDirectiveMode::Required {
+        let Some(requested) = workspace_request else {
+            if self.workspace.required {
                 return Err(anyhow!(
-                    "missing cwd directive; start the thread with [cwd:/workspace/<project>] for an existing project or [mkd:/workspace/<project>] to create one"
+                    "missing workspace directive; start the thread with [[ws:<name>]] for an existing workspace or [[ws:<name> --create]] to create one"
                 ));
             }
             return Ok(None);
         };
 
-        let cwd = self.validate_requested_cwd(requested)?;
-        Ok(Some(CwdDirectiveRequest::Existing(cwd)))
+        let workspace = self.validate_requested_workspace(requested)?;
+        Ok(Some(WorkspaceRequest::Existing(workspace)))
     }
 
     async fn resolve_working_dir(
         &self,
         thread_id: &str,
-        cwd_request: Option<&CwdDirectiveRequest>,
+        workspace_request: Option<&WorkspaceRequest>,
     ) -> Result<String> {
-        if self.cwd_directive == CwdDirectiveMode::Off {
-            if cwd_request.is_some() {
-                return Err(anyhow!("cwd directives are disabled for this agent"));
-            }
-        } else {
+        if self.workspace_enabled() {
             let existing_workdir = {
                 let state = self.state.read().await;
                 state.workdirs.get(thread_id).cloned()
             };
 
             if let Some(existing) = existing_workdir {
-                if let Some(requested) = cwd_request {
-                    let requested = self.prepare_cwd_request(Some(requested))?;
-                    let requested = requested
-                        .as_ref()
-                        .expect("Some request should stay Some")
-                        .path()
-                        .to_string();
-                    if requested != existing {
-                        return Err(anyhow!(
-                            "thread already bound to cwd {existing}; start a new thread for {requested}"
-                        ));
-                    }
+                if workspace_request.is_some() {
+                    return Err(anyhow!(
+                        "thread already has workspace {existing}; start a new thread to change workspace"
+                    ));
                 }
                 return Ok(existing);
             }
 
-            if let Some(requested) = cwd_request {
-                let prepared = self.prepare_cwd_request(Some(requested))?;
+            if let Some(requested) = workspace_request {
+                let prepared = self.prepare_workspace_request(Some(requested))?;
                 let cwd = prepared
                     .as_ref()
                     .expect("Some request should stay Some")
-                    .path()
+                    .name()
                     .to_string();
                 let mut state = self.state.write().await;
                 if let Some(existing) = state.workdirs.get(thread_id) {
-                    if existing != &cwd {
-                        return Err(anyhow!(
-                            "thread already bound to cwd {existing}; start a new thread for {cwd}"
-                        ));
-                    }
-                    return Ok(existing.clone());
+                    return Err(anyhow!(
+                        "thread already has workspace {existing}; start a new thread to change workspace"
+                    ));
                 }
                 state.workdirs.insert(thread_id.to_string(), cwd.clone());
                 self.save_workdir_mapping(&state.workdirs);
-                info!(thread_id, working_dir = %cwd, "bound thread cwd");
+                info!(thread_id, working_dir = %cwd, "bound thread workspace");
                 return Ok(cwd);
             }
 
-            if self.cwd_directive == CwdDirectiveMode::Required {
+            if self.workspace.required {
                 return Err(anyhow!(
-                    "missing cwd directive; start the thread with [cwd:/workspace/<project>] for an existing project or [mkd:/workspace/<project>] to create one"
+                    "missing workspace directive; start the thread with [[ws:<name>]] for an existing workspace or [[ws:<name> --create]] to create one"
                 ));
             }
         }
@@ -335,14 +341,16 @@ impl SessionPool {
     pub async fn get_or_create(
         &self,
         thread_id: &str,
-        cwd_request: Option<&CwdDirectiveRequest>,
+        workspace_request: Option<&WorkspaceRequest>,
     ) -> Result<()> {
         let create_gate = {
             let mut state = self.state.write().await;
             get_or_insert_gate(&mut state.creating, thread_id)
         };
         let _create_guard = create_gate.lock().await;
-        let working_dir = self.resolve_working_dir(thread_id, cwd_request).await?;
+        let working_dir = self
+            .resolve_working_dir(thread_id, workspace_request)
+            .await?;
 
         let (existing, saved_session_id) = {
             let state = self.state.read().await;
@@ -706,11 +714,41 @@ impl SessionPool {
 #[cfg(test)]
 mod tests {
     use super::{get_or_insert_gate, remove_if_same_handle, SessionPool};
-    use crate::config::{AgentConfig, CwdDirectiveMode, CwdDirectiveRequest};
+    use crate::config::{AgentConfig, WorkspaceConfig, WorkspaceRequest};
     use std::collections::HashMap;
+    use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Mutex;
+
+    fn agent_config(working_dir: &Path) -> AgentConfig {
+        AgentConfig {
+            command: "sh".to_string(),
+            args: vec!["-lc".to_string(), "cat".to_string()],
+            working_dir: working_dir.to_string_lossy().to_string(),
+            env: HashMap::new(),
+            inherit_env: Vec::new(),
+        }
+    }
+
+    fn workspace_config(root: &Path, required: bool) -> WorkspaceConfig {
+        WorkspaceConfig {
+            root: Some(root.to_string_lossy().to_string()),
+            required,
+        }
+    }
+
+    fn with_home<T>(home_dir: &Path, f: impl FnOnce() -> T) -> T {
+        let previous_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", home_dir);
+        let result = f();
+        if let Some(home) = previous_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        result
+    }
 
     #[test]
     fn remove_if_same_handle_removes_matching_entry() {
@@ -773,181 +811,254 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_working_dir_binds_required_mkd_without_rwlock_deadlock() {
+    async fn resolve_working_dir_binds_required_workspace_create_without_rwlock_deadlock() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let project_dir = tmp.path().join("project");
+        let root = tmp.path().join("workspaces");
+        let project_dir = root.join("project");
         let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(&root).expect("workspace root");
         std::fs::create_dir_all(&home_dir).expect("home dir");
 
-        let previous_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &home_dir);
-
-        let pool = SessionPool::new(
-            AgentConfig {
-                command: "sh".to_string(),
-                args: vec!["-lc".to_string(), "cat".to_string()],
-                working_dir: tmp.path().to_string_lossy().to_string(),
-                env: HashMap::new(),
-                inherit_env: Vec::new(),
-            },
-            1,
-            false,
-            CwdDirectiveMode::Required,
-            vec![tmp.path().to_string_lossy().to_string()],
-            true,
-        );
+        let pool = with_home(&home_dir, || {
+            SessionPool::new(
+                agent_config(tmp.path()),
+                1,
+                false,
+                workspace_config(&root, true),
+            )
+        });
 
         let result = tokio::time::timeout(
             Duration::from_millis(250),
             pool.resolve_working_dir(
                 "discord:test-thread",
-                Some(&CwdDirectiveRequest::Create(
-                    project_dir.to_string_lossy().to_string(),
-                )),
+                Some(&WorkspaceRequest::Create("project".to_string())),
             ),
         )
         .await
         .expect("resolve_working_dir should not deadlock")
-        .expect("cwd should resolve");
+        .expect("workspace should resolve");
 
         let expected = project_dir.canonicalize().expect("canonical project dir");
         assert_eq!(result, expected.to_string_lossy());
-
-        if let Some(home) = previous_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
     }
 
     #[tokio::test]
-    async fn resolve_working_dir_rejects_missing_cwd_without_mkd() {
+    async fn resolve_working_dir_rejects_missing_workspace_without_create() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let project_dir = tmp.path().join("missing-project");
+        let root = tmp.path().join("workspaces");
+        let project_dir = root.join("missing-project");
         let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(&root).expect("workspace root");
         std::fs::create_dir_all(&home_dir).expect("home dir");
 
-        let previous_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &home_dir);
-
-        let pool = SessionPool::new(
-            AgentConfig {
-                command: "sh".to_string(),
-                args: vec!["-lc".to_string(), "cat".to_string()],
-                working_dir: tmp.path().to_string_lossy().to_string(),
-                env: HashMap::new(),
-                inherit_env: Vec::new(),
-            },
-            1,
-            false,
-            CwdDirectiveMode::Required,
-            vec![tmp.path().to_string_lossy().to_string()],
-            true,
-        );
+        let pool = with_home(&home_dir, || {
+            SessionPool::new(
+                agent_config(tmp.path()),
+                1,
+                false,
+                workspace_config(&root, true),
+            )
+        });
 
         let err = pool
             .resolve_working_dir(
                 "discord:test-thread",
-                Some(&CwdDirectiveRequest::Existing(
-                    project_dir.to_string_lossy().to_string(),
-                )),
+                Some(&WorkspaceRequest::Existing("missing-project".to_string())),
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("use [mkd:/workspace/<project>]"));
+        assert!(err
+            .to_string()
+            .contains("use [[ws:missing-project --create]]"));
         assert!(!project_dir.exists());
-
-        if let Some(home) = previous_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
     }
 
     #[test]
-    fn prepare_cwd_request_creates_mkd_then_normalizes_to_existing() {
+    fn prepare_workspace_request_creates_then_normalizes_to_existing() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let project_dir = tmp.path().join("project");
+        let root = tmp.path().join("workspaces");
+        let project_dir = root.join("project");
         let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(&root).expect("workspace root");
         std::fs::create_dir_all(&home_dir).expect("home dir");
 
-        let previous_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &home_dir);
-
-        let pool = SessionPool::new(
-            AgentConfig {
-                command: "sh".to_string(),
-                args: vec!["-lc".to_string(), "cat".to_string()],
-                working_dir: tmp.path().to_string_lossy().to_string(),
-                env: HashMap::new(),
-                inherit_env: Vec::new(),
-            },
-            1,
-            false,
-            CwdDirectiveMode::Required,
-            vec![tmp.path().to_string_lossy().to_string()],
-            true,
-        );
+        let pool = with_home(&home_dir, || {
+            SessionPool::new(
+                agent_config(tmp.path()),
+                1,
+                false,
+                workspace_config(&root, true),
+            )
+        });
 
         let prepared = pool
-            .prepare_cwd_request(Some(&CwdDirectiveRequest::Create(
-                project_dir.to_string_lossy().to_string(),
-            )))
-            .expect("mkd should create and normalize")
+            .prepare_workspace_request(Some(&WorkspaceRequest::Create("project".to_string())))
+            .expect("workspace should create and normalize")
             .expect("request should stay present");
 
         let expected = project_dir.canonicalize().expect("canonical project dir");
         assert_eq!(
             prepared,
-            CwdDirectiveRequest::Existing(expected.to_string_lossy().to_string())
+            WorkspaceRequest::Existing(expected.to_string_lossy().to_string())
         );
-
-        if let Some(home) = previous_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
     }
 
     #[test]
-    fn prepare_cwd_request_rejects_existing_mkd() {
+    fn prepare_workspace_request_rejects_existing_create() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let project_dir = tmp.path().join("project");
+        let root = tmp.path().join("workspaces");
+        let project_dir = root.join("project");
         let home_dir = tmp.path().join("home");
         std::fs::create_dir_all(&project_dir).expect("project dir");
         std::fs::create_dir_all(&home_dir).expect("home dir");
 
-        let previous_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &home_dir);
-
-        let pool = SessionPool::new(
-            AgentConfig {
-                command: "sh".to_string(),
-                args: vec!["-lc".to_string(), "cat".to_string()],
-                working_dir: tmp.path().to_string_lossy().to_string(),
-                env: HashMap::new(),
-                inherit_env: Vec::new(),
-            },
-            1,
-            false,
-            CwdDirectiveMode::Required,
-            vec![tmp.path().to_string_lossy().to_string()],
-            true,
-        );
+        let pool = with_home(&home_dir, || {
+            SessionPool::new(
+                agent_config(tmp.path()),
+                1,
+                false,
+                workspace_config(&root, true),
+            )
+        });
 
         let err = pool
-            .prepare_cwd_request(Some(&CwdDirectiveRequest::Create(
-                project_dir.to_string_lossy().to_string(),
-            )))
+            .prepare_workspace_request(Some(&WorkspaceRequest::Create("project".to_string())))
             .unwrap_err();
 
-        assert!(err.to_string().contains("cwd already exists"));
-        assert!(err.to_string().contains("use [cwd:/workspace/<project>]"));
+        assert!(err.to_string().contains("workspace already exists"));
+        assert!(err.to_string().contains("use [[ws:project]]"));
+    }
 
-        if let Some(home) = previous_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
+    #[test]
+    fn prepare_workspace_request_ignores_ws_when_workspace_root_unset() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(&home_dir).expect("home dir");
+
+        let pool = with_home(&home_dir, || {
+            SessionPool::new(
+                agent_config(tmp.path()),
+                1,
+                false,
+                WorkspaceConfig::default(),
+            )
+        });
+
+        let prepared = pool
+            .prepare_workspace_request(Some(&WorkspaceRequest::Existing("foo".to_string())))
+            .expect("workspace feature should be disabled");
+        assert_eq!(prepared, None);
+    }
+
+    #[test]
+    fn prepare_workspace_request_requires_ws_when_required() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspaces");
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(&root).expect("workspace root");
+        std::fs::create_dir_all(&home_dir).expect("home dir");
+
+        let pool = with_home(&home_dir, || {
+            SessionPool::new(
+                agent_config(tmp.path()),
+                1,
+                false,
+                workspace_config(&root, true),
+            )
+        });
+
+        let err = pool.prepare_workspace_request(None).unwrap_err();
+        assert!(err.to_string().contains("missing workspace directive"));
+    }
+
+    #[test]
+    fn prepare_workspace_request_allows_nested_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspaces");
+        let project_dir = root.join("team").join("foo");
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        std::fs::create_dir_all(&home_dir).expect("home dir");
+
+        let pool = with_home(&home_dir, || {
+            SessionPool::new(
+                agent_config(tmp.path()),
+                1,
+                false,
+                workspace_config(&root, false),
+            )
+        });
+
+        let prepared = pool
+            .prepare_workspace_request(Some(&WorkspaceRequest::Existing("team/foo".to_string())))
+            .expect("nested workspace should resolve")
+            .expect("request should stay present");
+
+        let expected = project_dir.canonicalize().expect("canonical project dir");
+        assert_eq!(
+            prepared,
+            WorkspaceRequest::Existing(expected.to_string_lossy().to_string())
+        );
+    }
+
+    #[test]
+    fn prepare_workspace_request_rejects_absolute_and_parent_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspaces");
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(&root).expect("workspace root");
+        std::fs::create_dir_all(&home_dir).expect("home dir");
+
+        let pool = with_home(&home_dir, || {
+            SessionPool::new(
+                agent_config(tmp.path()),
+                1,
+                false,
+                workspace_config(&root, false),
+            )
+        });
+
+        let err = pool
+            .prepare_workspace_request(Some(&WorkspaceRequest::Existing("/tmp/foo".to_string())))
+            .unwrap_err();
+        assert!(err.to_string().contains("relative path"));
+
+        let err = pool
+            .prepare_workspace_request(Some(&WorkspaceRequest::Existing("../foo".to_string())))
+            .unwrap_err();
+        assert!(err.to_string().contains("unsafe path components"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_workspace_request_rejects_symlink_parent_escape_before_create() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspaces");
+        let outside = tmp.path().join("outside");
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(&root).expect("workspace root");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        std::fs::create_dir_all(&home_dir).expect("home dir");
+        symlink(&outside, root.join("link")).expect("symlink");
+
+        let pool = with_home(&home_dir, || {
+            SessionPool::new(
+                agent_config(tmp.path()),
+                1,
+                false,
+                workspace_config(&root, false),
+            )
+        });
+
+        let err = pool
+            .prepare_workspace_request(Some(&WorkspaceRequest::Create("link/new".to_string())))
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("workspace parent is outside the workspace root"));
+        assert!(!outside.join("new").exists());
     }
 }

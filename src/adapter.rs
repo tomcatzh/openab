@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tracing::{error, warn};
 
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
-use crate::config::{CwdDirectiveRequest, ReactionsConfig, ToolDisplay};
+use crate::config::{ReactionsConfig, ToolDisplay, WorkspaceRequest};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::markdown::{self, TableMode};
@@ -163,9 +163,22 @@ pub struct MessageContext {
     pub thread_channel: ChannelRef,
     pub sender_json: String,
     pub prompt: String,
+    pub session_directives: SessionDirectives,
     pub extra_blocks: Vec<ContentBlock>,
     pub trigger_msg: MessageRef,
     pub other_bot_present: bool,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct SessionDirectives {
+    pub workspace: Option<WorkspaceRequest>,
+    pub title: Option<String>,
+}
+
+impl SessionDirectives {
+    pub fn has_any(&self) -> bool {
+        self.workspace.is_some() || self.title.is_some()
+    }
 }
 
 /// Sender identity injected into prompts for downstream agent context.
@@ -351,44 +364,82 @@ impl AdapterRouter {
         blocks
     }
 
-    /// Extract a leading project cwd directive from user-visible prompt text.
-    /// `[cwd:/path]` selects an existing directory. `[mkd:/path]` explicitly
-    /// creates a missing directory when the agent allows cwd creation.
-    /// Double-bracket forms (`[[cwd:/path]]`, `[[mkd:/path]]`) are also
-    /// accepted for this deployment's explicit marker style.
-    pub fn extract_cwd_directive(prompt: &str) -> Result<(Option<CwdDirectiveRequest>, String)> {
-        let trimmed = prompt.trim_start();
-        let leading_len = prompt.len() - trimmed.len();
+    /// Parse user-facing session initialization directives.
+    /// Supported input directives are `[[ws:name]]`, `[[ws:name --create]]`,
+    /// and `[[title:...]]`. Directives may be inline or on separate lines and
+    /// are stripped before the prompt reaches the agent. Unknown keys are
+    /// treated as errors so typos do not silently change behavior.
+    pub fn parse_session_directives(prompt: &str) -> Result<(SessionDirectives, String)> {
+        let mut directives = SessionDirectives::default();
+        let mut cleaned = String::with_capacity(prompt.len());
+        let mut rest = prompt;
 
-        let forms = [
-            ("[[cwd:", "]]", false),
-            ("[cwd:", "]", false),
-            ("[[mkd:", "]]", true),
-            ("[mkd:", "]", true),
-        ];
-        for (open, close, create_missing) in forms {
-            if let Some(after_open) = trimmed.strip_prefix(open) {
-                let Some(close_idx) = after_open.find(close) else {
-                    return Err(anyhow!("unterminated cwd/mkd directive"));
-                };
-                let cwd = after_open[..close_idx].trim();
-                if cwd.is_empty() {
-                    return Err(anyhow!("empty cwd/mkd directive"));
+        while let Some(open_idx) = rest.find("[[") {
+            cleaned.push_str(&rest[..open_idx]);
+            let after_open = &rest[open_idx + 2..];
+            let Some(close_idx) = after_open.find("]]") else {
+                return Err(anyhow!("unterminated session directive"));
+            };
+            let inner = after_open[..close_idx].trim();
+            let Some((raw_key, raw_value)) = inner.split_once(':') else {
+                return Err(anyhow!("malformed session directive: [[{inner}]]"));
+            };
+            let key = raw_key.trim();
+            let value = raw_value.trim();
+            match key {
+                "ws" => {
+                    directives.workspace = Some(Self::parse_workspace_directive(value)?);
                 }
-                let rest = after_open[close_idx + close.len()..].trim_start();
-                let mut cleaned = String::new();
-                cleaned.push_str(&prompt[..leading_len]);
-                cleaned.push_str(rest);
-                let request = if create_missing {
-                    CwdDirectiveRequest::Create(cwd.to_string())
-                } else {
-                    CwdDirectiveRequest::Existing(cwd.to_string())
-                };
-                return Ok((Some(request), cleaned));
+                "title" => {
+                    if value.is_empty() {
+                        return Err(anyhow!("empty title directive"));
+                    }
+                    directives.title = Some(value.to_string());
+                }
+                "" => return Err(anyhow!("empty session directive key")),
+                other => return Err(anyhow!("unknown session directive: {other}")),
+            }
+            rest = &after_open[close_idx + 2..];
+        }
+        cleaned.push_str(rest);
+
+        Ok((directives, Self::clean_stripped_prompt(&cleaned)))
+    }
+
+    fn parse_workspace_directive(value: &str) -> Result<WorkspaceRequest> {
+        let mut parts = value.split_whitespace();
+        let Some(name) = parts.next() else {
+            return Err(anyhow!("empty workspace directive"));
+        };
+        let mut create = false;
+        for flag in parts {
+            match flag {
+                "--create" => create = true,
+                other => return Err(anyhow!("unknown workspace flag: {other}")),
             }
         }
+        if create {
+            Ok(WorkspaceRequest::Create(name.to_string()))
+        } else {
+            Ok(WorkspaceRequest::Existing(name.to_string()))
+        }
+    }
 
-        Ok((None, prompt.to_string()))
+    fn clean_stripped_prompt(prompt: &str) -> String {
+        let lines: Vec<&str> = prompt.lines().collect();
+        let first = lines.iter().position(|line| !line.trim().is_empty());
+        let last = lines.iter().rposition(|line| !line.trim().is_empty());
+        let Some(first) = first else {
+            return String::new();
+        };
+        let Some(last) = last else {
+            return String::new();
+        };
+        lines[first..=last]
+            .iter()
+            .map(|line| line.trim())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Handle an incoming user message. The adapter is responsible for
@@ -401,7 +452,12 @@ impl AdapterRouter {
     ) -> Result<()> {
         tracing::debug!(platform = adapter.platform(), "processing message");
 
-        let (cwd_request, prompt) = Self::extract_cwd_directive(&ctx.prompt)?;
+        let (parsed_directives, prompt) = Self::parse_session_directives(&ctx.prompt)?;
+        let session_directives = if ctx.session_directives.has_any() {
+            ctx.session_directives
+        } else {
+            parsed_directives
+        };
         let content_blocks = Self::pack_arrival_event(&ctx.sender_json, &prompt, ctx.extra_blocks);
 
         let thread_key = format!(
@@ -415,7 +471,7 @@ impl AdapterRouter {
 
         if let Err(e) = self
             .pool
-            .get_or_create(&thread_key, cwd_request.as_ref())
+            .get_or_create(&thread_key, session_directives.workspace.as_ref())
             .await
         {
             let msg = format_user_error(&e.to_string());
@@ -1092,7 +1148,7 @@ mod tests {
 
 #[cfg(test)]
 mod directive_tests {
-    use crate::config::CwdDirectiveRequest;
+    use crate::config::WorkspaceRequest;
 
     use super::{parse_output_directives, AdapterRouter};
 
@@ -1248,60 +1304,91 @@ mod directive_tests {
     }
 
     #[test]
-    fn extract_cwd_directive_double_bracket() {
-        let (cwd, content) =
-            AdapterRouter::extract_cwd_directive("[[cwd:/workspace/foo]]  do work").unwrap();
+    fn parse_session_directives_inline_ws_title() {
+        let (directives, content) =
+            AdapterRouter::parse_session_directives("[[ws:foo]] [[title:修 bug]]  do work")
+                .unwrap();
         assert_eq!(
-            cwd,
-            Some(CwdDirectiveRequest::Existing("/workspace/foo".to_string()))
+            directives.workspace,
+            Some(WorkspaceRequest::Existing("foo".to_string()))
         );
+        assert_eq!(directives.title, Some("修 bug".to_string()));
         assert_eq!(content, "do work");
     }
 
     #[test]
-    fn extract_cwd_directive_single_bracket() {
-        let (cwd, content) =
-            AdapterRouter::extract_cwd_directive("[cwd:/workspace/foo]\ndo work").unwrap();
+    fn parse_session_directives_multiline_and_create() {
+        let (directives, content) =
+            AdapterRouter::parse_session_directives("[[ws:team/foo --create]]\n開始調查").unwrap();
         assert_eq!(
-            cwd,
-            Some(CwdDirectiveRequest::Existing("/workspace/foo".to_string()))
+            directives.workspace,
+            Some(WorkspaceRequest::Create("team/foo".to_string()))
         );
-        assert_eq!(content, "do work");
+        assert_eq!(content, "開始調查");
     }
 
     #[test]
-    fn extract_mkd_directive_double_bracket() {
-        let (cwd, content) =
-            AdapterRouter::extract_cwd_directive("[[mkd:/workspace/foo]]  do work").unwrap();
+    fn parse_session_directives_duplicate_key_last_wins() {
+        let (directives, content) = AdapterRouter::parse_session_directives(
+            "[[ws:foo]] [[ws:bar]] [[title:old]] [[title:new]] work",
+        )
+        .unwrap();
         assert_eq!(
-            cwd,
-            Some(CwdDirectiveRequest::Create("/workspace/foo".to_string()))
+            directives.workspace,
+            Some(WorkspaceRequest::Existing("bar".to_string()))
         );
-        assert_eq!(content, "do work");
+        assert_eq!(directives.title, Some("new".to_string()));
+        assert_eq!(content, "work");
     }
 
     #[test]
-    fn extract_mkd_directive_single_bracket() {
-        let (cwd, content) =
-            AdapterRouter::extract_cwd_directive("[mkd:/workspace/foo]\ndo work").unwrap();
-        assert_eq!(
-            cwd,
-            Some(CwdDirectiveRequest::Create("/workspace/foo".to_string()))
-        );
-        assert_eq!(content, "do work");
-    }
-
-    #[test]
-    fn extract_cwd_directive_absent_preserves_prompt() {
+    fn parse_session_directives_absent_preserves_prompt() {
         let input = "do work in /workspace/foo";
-        let (cwd, content) = AdapterRouter::extract_cwd_directive(input).unwrap();
-        assert_eq!(cwd, None);
+        let (directives, content) = AdapterRouter::parse_session_directives(input).unwrap();
+        assert_eq!(directives.workspace, None);
+        assert_eq!(directives.title, None);
         assert_eq!(content, input);
     }
 
     #[test]
-    fn extract_cwd_directive_rejects_unterminated() {
-        let err = AdapterRouter::extract_cwd_directive("[[cwd:/workspace/foo").unwrap_err();
-        assert!(err.to_string().contains("unterminated cwd/mkd directive"));
+    fn parse_session_directives_old_cwd_syntax_is_plain_prompt() {
+        let input = "[cwd:/workspace/foo]\ndo work";
+        let (directives, content) = AdapterRouter::parse_session_directives(input).unwrap();
+        assert_eq!(directives.workspace, None);
+        assert_eq!(directives.title, None);
+        assert_eq!(content, input);
+    }
+
+    #[test]
+    fn parse_session_directives_unknown_key_errors() {
+        let err = AdapterRouter::parse_session_directives("[[wz:foo]] do work").unwrap_err();
+        assert!(err.to_string().contains("unknown session directive: wz"));
+    }
+
+    #[test]
+    fn parse_session_directives_unknown_flag_errors() {
+        let err = AdapterRouter::parse_session_directives("[[ws:foo --init]] do work").unwrap_err();
+        assert!(err.to_string().contains("unknown workspace flag: --init"));
+    }
+
+    #[test]
+    fn parse_session_directives_empty_values_error() {
+        let err = AdapterRouter::parse_session_directives("[[ws:]] do work").unwrap_err();
+        assert!(err.to_string().contains("empty workspace directive"));
+
+        let err = AdapterRouter::parse_session_directives("[[title:]] do work").unwrap_err();
+        assert!(err.to_string().contains("empty title directive"));
+    }
+
+    #[test]
+    fn parse_session_directives_rejects_unterminated() {
+        let err = AdapterRouter::parse_session_directives("[[ws:foo").unwrap_err();
+        assert!(err.to_string().contains("unterminated session directive"));
+    }
+
+    #[test]
+    fn parse_session_directives_rejects_malformed() {
+        let err = AdapterRouter::parse_session_directives("[[ws]] do work").unwrap_err();
+        assert!(err.to_string().contains("malformed session directive"));
     }
 }

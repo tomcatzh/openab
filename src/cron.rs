@@ -728,6 +728,7 @@ async fn fire_cronjob(
                 thread_channel: reply_channel.clone(),
                 sender_json,
                 prompt: job.message.clone(),
+                session_directives: crate::adapter::SessionDirectives::default(),
                 extra_blocks: vec![],
                 trigger_msg,
                 other_bot_present: false,

@@ -165,6 +165,31 @@ working_dir = "/home/agent"
 
 ---
 
+## `[workspace]`
+
+Optional project workspace routing for session initialization directives.
+
+When omitted, `[[ws:...]]` directives are parsed and stripped but do not change
+the agent working directory. Unknown directive keys still error before a session
+starts.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `root` | string | unset | Container-visible workspace root. The Helm chart renders configured `agents.<name>.workspace.root` host paths as this fixed runtime path: `/workspace`. |
+| `required` | bool | `false` | When true, a new session must start with `[[ws:<name>]]` or `[[ws:<name> --create]]`. |
+
+Supported user directives:
+
+- `[[ws:foo]]`: use existing `/workspace/foo`.
+- `[[ws:foo --create]]`: create missing `/workspace/foo`, failing if it already exists.
+- `[[title:修 bug]]`: set the Discord thread title for a new thread.
+
+Workspace names must be relative paths under `root`; absolute paths, `.`, `..`,
+ancestor escapes, symlink escapes, empty values, unknown flags, and unknown
+directive keys are rejected before the agent turn starts.
+
+---
+
 ## `[pool]`
 
 Session pool settings for managing concurrent agent sessions.
@@ -173,10 +198,7 @@ Session pool settings for managing concurrent agent sessions.
 |-----|------|---------|-------------|
 | `max_sessions` | usize | `10` | Maximum number of concurrent agent sessions. When full, the oldest idle session is suspended (recoverable); if all sessions are busy, new requests are rejected. |
 | `session_ttl_hours` | u64 | `4` | Session time-to-live in hours. Idle sessions are reclaimed after this period. The example config uses `24`. |
-| `per_thread_workdir` | bool | `false` | When enabled, sessions without explicit cwd routing use `<working_dir>/sessions/<thread_key>/`. Aligned with the upstream per-thread workdir direction. |
-| `cwd_directive` | string | `"off"` | Controls first-message cwd routing via `[cwd:/path]` or `[[cwd:/path]]`. Values: `"off"`, `"optional"`, `"required"`. |
-| `cwd_allowed_roots` | string[] | `[]` | Absolute roots allowed for explicit cwd routing. Empty means only `working_dir` is allowed. |
-| `cwd_create_missing` | bool | `false` | Whether missing explicit cwd paths may be created under an allowed root. |
+| `per_thread_workdir` | bool | `false` | When enabled, sessions without workspace routing use `<working_dir>/sessions/<thread_key>/`. Aligned with the upstream per-thread workdir direction. |
 
 ---
 

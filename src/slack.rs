@@ -1212,7 +1212,7 @@ async fn handle_message(
         sender_json,
         sender_name: sender.sender_name.clone(),
         prompt,
-        cwd_request: None,
+        workspace_request: None,
         extra_blocks,
         trigger_msg,
         arrived_at: std::time::Instant::now(),

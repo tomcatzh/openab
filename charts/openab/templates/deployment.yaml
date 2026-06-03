@@ -2,6 +2,7 @@
 {{- if ne (include "openab.agentEnabled" $cfg) "false" }}
 {{- $d := dict "ctx" $ "agent" $name "cfg" $cfg }}
 {{- $pvcEnabled := not (eq (include "openab.persistenceEnabled" $cfg) "false") }}
+{{- $workspace := ($cfg.workspace | default dict) }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -126,6 +127,10 @@ spec:
               mountPath: {{ $cfg.workingDir | default "/home/agent" }}/GEMINI.md
               subPath: AGENTS.md
             {{- end }}
+            {{- if $workspace.root }}
+            - name: workspace-root
+              mountPath: /workspace
+            {{- end }}
             - name: tmp
               mountPath: /tmp
             {{- with $cfg.extraVolumeMounts }}
@@ -154,6 +159,12 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: {{ (and $cfg.persistence $cfg.persistence.existingClaim) | default (include "openab.agentFullname" $d) }}
+        {{- end }}
+        {{- if $workspace.root }}
+        - name: workspace-root
+          hostPath:
+            path: {{ $workspace.root | quote }}
+            type: Directory
         {{- end }}
         - name: tmp
           emptyDir: {}

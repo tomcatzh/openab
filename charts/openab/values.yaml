@@ -315,6 +315,13 @@ agents:
       # maxBatchTokens: soft token cap per ACP turn for batching modes (default 24000)
       # maxBatchTokens: 24000
     workingDir: /home/agent
+    workspace:
+      # Host path mounted into the container at /workspace.
+      # Empty disables [[ws:...]] directory routing.
+      root: ""
+      # When true, a new session must start with [[ws:<name>]] or
+      # [[ws:<name> --create]].
+      required: false
     env: {}
     # Load env vars from existing Secrets or ConfigMaps, e.g. GH_TOKEN.
     envFrom: []
@@ -326,13 +333,6 @@ agents:
       # When true, sessions without an explicit cwd use
       # <workingDir>/sessions/<thread_key>/.
       perThreadWorkdir: false
-      # Local project-cwd routing extension:
-      # off | optional | required
-      cwdDirective: "off"
-      # Absolute roots allowed for [cwd:/path] / [[cwd:/path]] routing.
-      cwdAllowedRoots: []
-      # If true, missing cwd paths under allowed roots are created.
-      cwdCreateMissing: false
     reactions:
       enabled: true
       removeAfterReply: false

@@ -19,7 +19,7 @@ use tracing::{debug, error, info, info_span, warn};
 
 use crate::acp::ContentBlock;
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef};
-use crate::config::{CwdDirectiveMode, CwdDirectiveRequest, ReactionsConfig};
+use crate::config::{ReactionsConfig, WorkspaceRequest};
 use crate::error_display::format_user_error;
 use crate::reactions::StatusReactionController;
 
@@ -37,9 +37,9 @@ pub struct BufferedMessage {
     pub sender_name: String,
     /// User-visible prompt text (verbatim, never transformed).
     pub prompt: String,
-    /// Pre-parsed cwd directive from adapters that must validate before
+    /// Pre-parsed workspace directive from adapters that must validate before
     /// creating platform-specific resources such as Discord threads.
-    pub cwd_request: Option<CwdDirectiveRequest>,
+    pub workspace_request: Option<WorkspaceRequest>,
     /// Attachment blocks (images, STT transcripts) in arrival order.
     pub extra_blocks: Vec<ContentBlock>,
     /// Anchor for reactions (👀 / ❌).
@@ -120,22 +120,20 @@ impl ThreadHandle {
 pub trait DispatchTarget: Send + Sync + 'static {
     fn reactions_config(&self) -> &ReactionsConfig;
 
-    fn cwd_directive_mode(&self) -> CwdDirectiveMode;
-
-    /// Validate an optional cwd directive before platform resources such as
-    /// Discord threads are created. A successful `[mkd]` is normalised to
-    /// `Existing(canonical_path)` so the later session creation path does not
-    /// try to create it a second time.
-    fn prepare_cwd_request(
+    /// Validate an optional workspace directive before platform resources such
+    /// as Discord threads are created. A successful `--create` is normalised to
+    /// `Existing(canonical_path)` so later session creation does not create it
+    /// a second time.
+    fn prepare_workspace_request(
         &self,
-        cwd_request: Option<&CwdDirectiveRequest>,
-    ) -> Result<Option<CwdDirectiveRequest>>;
+        workspace_request: Option<&WorkspaceRequest>,
+    ) -> Result<Option<WorkspaceRequest>>;
 
     /// Ensure the ACP session for `session_key` exists (idempotent).
     async fn ensure_session(
         &self,
         session_key: &str,
-        cwd_request: Option<&CwdDirectiveRequest>,
+        workspace_request: Option<&WorkspaceRequest>,
     ) -> Result<()>;
 
     /// Drive one ACP turn with the pre-packed `content_blocks`.
@@ -157,23 +155,21 @@ impl DispatchTarget for AdapterRouter {
         AdapterRouter::reactions_config(self)
     }
 
-    fn cwd_directive_mode(&self) -> CwdDirectiveMode {
-        self.pool().cwd_directive_mode()
-    }
-
-    fn prepare_cwd_request(
+    fn prepare_workspace_request(
         &self,
-        cwd_request: Option<&CwdDirectiveRequest>,
-    ) -> Result<Option<CwdDirectiveRequest>> {
-        self.pool().prepare_cwd_request(cwd_request)
+        workspace_request: Option<&WorkspaceRequest>,
+    ) -> Result<Option<WorkspaceRequest>> {
+        self.pool().prepare_workspace_request(workspace_request)
     }
 
     async fn ensure_session(
         &self,
         session_key: &str,
-        cwd_request: Option<&CwdDirectiveRequest>,
+        workspace_request: Option<&WorkspaceRequest>,
     ) -> Result<()> {
-        self.pool().get_or_create(session_key, cwd_request).await
+        self.pool()
+            .get_or_create(session_key, workspace_request)
+            .await
     }
 
     async fn stream_prompt_blocks(
@@ -300,15 +296,11 @@ impl Dispatcher {
         }
     }
 
-    pub fn cwd_directive_mode(&self) -> CwdDirectiveMode {
-        self.target.cwd_directive_mode()
-    }
-
-    pub fn prepare_cwd_request(
+    pub fn prepare_workspace_request(
         &self,
-        cwd_request: Option<&CwdDirectiveRequest>,
-    ) -> Result<Option<CwdDirectiveRequest>> {
-        self.target.prepare_cwd_request(cwd_request)
+        workspace_request: Option<&WorkspaceRequest>,
+    ) -> Result<Option<WorkspaceRequest>> {
+        self.target.prepare_workspace_request(workspace_request)
     }
 
     /// Build the shared session pool key for a routed channel.
@@ -657,48 +649,36 @@ async fn dispatch_batch(
     // Anchor reactions on the last message in the batch (before consuming).
     let trigger_msg = batch.last().unwrap().trigger_msg.clone();
 
-    let mut cwd_request: Option<CwdDirectiveRequest> = None;
+    let mut workspace_request: Option<WorkspaceRequest> = None;
     let mut cleaned_batch = Vec::with_capacity(batch.len());
     for mut msg in batch {
-        let adapter_cwd = msg.cwd_request.take();
-        match AdapterRouter::extract_cwd_directive(&msg.prompt) {
-            Ok((cwd, cleaned_prompt)) => {
-                let cwd = match (adapter_cwd, cwd) {
-                    (Some(adapter_cwd), Some(prompt_cwd)) => {
-                        match adapter_cwd.prefer_create(prompt_cwd) {
-                            Ok(cwd) => Some(cwd),
-                            Err(e) => {
-                                let _ = adapter
-                                    .send_message(
-                                        thread_channel,
-                                        "⚠️ conflicting cwd directives in one message; start a new thread with one cwd",
-                                    )
-                                    .await;
-                                error!("conflicting adapter and prompt cwd directives in dispatch_batch: {e}");
-                                return;
-                            }
-                        }
-                    }
-                    (Some(adapter_cwd), _) => Some(adapter_cwd),
-                    (None, prompt_cwd) => prompt_cwd,
-                };
-                if let Some(cwd) = cwd {
-                    if let Some(existing) = cwd_request.take() {
-                        match existing.prefer_create(cwd) {
-                            Ok(merged) => cwd_request = Some(merged),
-                            Err(e) => {
-                                let _ = adapter
-                                    .send_message(
-                                        thread_channel,
-                                        "⚠️ conflicting cwd directives in one batch; start a new thread with one cwd",
-                                    )
-                                    .await;
-                                error!("conflicting cwd directives in dispatch_batch: {e}");
-                                return;
-                            }
+        let adapter_workspace = msg.workspace_request.take();
+        match AdapterRouter::parse_session_directives(&msg.prompt) {
+            Ok((directives, cleaned_prompt)) => {
+                if directives.has_any() {
+                    let _ = adapter
+                        .send_message(
+                            thread_channel,
+                            "⚠️ session directives are only allowed when starting a new thread; start a new thread to change workspace or title",
+                        )
+                        .await;
+                    error!("session directive found in an existing dispatch batch");
+                    return;
+                }
+                if let Some(adapter_workspace) = adapter_workspace {
+                    if let Some(existing) = &workspace_request {
+                        if existing != &adapter_workspace {
+                            let _ = adapter
+                                .send_message(
+                                    thread_channel,
+                                    "⚠️ conflicting workspace directives in one dispatch; start a new thread with one workspace",
+                                )
+                                .await;
+                            error!("conflicting adapter workspace directives in dispatch_batch");
+                            return;
                         }
                     } else {
-                        cwd_request = Some(cwd);
+                        workspace_request = Some(adapter_workspace);
                     }
                 }
                 msg.prompt = cleaned_prompt;
@@ -709,7 +689,7 @@ async fn dispatch_batch(
                 let _ = adapter
                     .send_message(thread_channel, &format!("⚠️ {user_msg}"))
                     .await;
-                error!("cwd directive parse error in dispatch_batch: {e}");
+                error!("session directive parse error in dispatch_batch: {e}");
                 return;
             }
         }
@@ -727,7 +707,7 @@ async fn dispatch_batch(
 
     // Ensure session exists.
     if let Err(e) = target
-        .ensure_session(&session_key, cwd_request.as_ref())
+        .ensure_session(&session_key, workspace_request.as_ref())
         .await
     {
         let user_msg = format_user_error(&e.to_string());
@@ -1176,9 +1156,7 @@ mod tests {
             agent_cfg,
             1,
             false,
-            crate::config::CwdDirectiveMode::Off,
-            Vec::new(),
-            false,
+            crate::config::WorkspaceConfig::default(),
         ));
         let router = Arc::new(AdapterRouter::new(
             pool,
@@ -1348,6 +1326,7 @@ mod tests {
     struct MockDispatchTarget {
         reactions: ReactionsConfig,
         calls: Mutex<Vec<RecordedDispatch>>,
+        ensure_workspaces: Mutex<Vec<Option<WorkspaceRequest>>>,
         /// If set, `ensure_session` returns this error once.
         ensure_err: Mutex<Option<String>>,
         /// If set, `stream_prompt_blocks` returns this error once.
@@ -1359,6 +1338,7 @@ mod tests {
             Self {
                 reactions: ReactionsConfig::default(),
                 calls: Mutex::new(Vec::new()),
+                ensure_workspaces: Mutex::new(Vec::new()),
                 ensure_err: Mutex::new(None),
                 stream_err: Mutex::new(None),
             }
@@ -1366,6 +1346,10 @@ mod tests {
 
         fn calls(&self) -> Vec<RecordedDispatch> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn ensure_workspaces(&self) -> Vec<Option<WorkspaceRequest>> {
+            self.ensure_workspaces.lock().unwrap().clone()
         }
     }
 
@@ -1375,22 +1359,22 @@ mod tests {
             &self.reactions
         }
 
-        fn cwd_directive_mode(&self) -> CwdDirectiveMode {
-            CwdDirectiveMode::Off
-        }
-
-        fn prepare_cwd_request(
+        fn prepare_workspace_request(
             &self,
-            cwd_request: Option<&CwdDirectiveRequest>,
-        ) -> Result<Option<CwdDirectiveRequest>> {
-            Ok(cwd_request.cloned())
+            workspace_request: Option<&WorkspaceRequest>,
+        ) -> Result<Option<WorkspaceRequest>> {
+            Ok(workspace_request.cloned())
         }
 
         async fn ensure_session(
             &self,
             _session_key: &str,
-            _cwd_request: Option<&CwdDirectiveRequest>,
+            workspace_request: Option<&WorkspaceRequest>,
         ) -> Result<()> {
+            self.ensure_workspaces
+                .lock()
+                .unwrap()
+                .push(workspace_request.cloned());
             if let Some(msg) = self.ensure_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
             }
@@ -1420,7 +1404,16 @@ mod tests {
     /// Mock `ChatAdapter` — every method is a no-op success. The dispatch loop
     /// invokes `add_reaction` (queued 👀), `platform`, and on the error path
     /// `send_message`; nothing else needs real behavior here.
-    struct MockChatAdapter;
+    #[derive(Default)]
+    struct MockChatAdapter {
+        sent_messages: Mutex<Vec<String>>,
+    }
+
+    impl MockChatAdapter {
+        fn sent_messages(&self) -> Vec<String> {
+            self.sent_messages.lock().unwrap().clone()
+        }
+    }
 
     #[async_trait]
     impl ChatAdapter for MockChatAdapter {
@@ -1431,7 +1424,8 @@ mod tests {
             2000
         }
 
-        async fn send_message(&self, channel: &ChannelRef, _content: &str) -> Result<MessageRef> {
+        async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
+            self.sent_messages.lock().unwrap().push(content.to_string());
             Ok(MessageRef {
                 channel: channel.clone(),
                 message_id: "mock-msg".into(),
@@ -1474,7 +1468,7 @@ mod tests {
                 .into(),
             sender_name: "u".into(),
             prompt: prompt.into(),
-            cwd_request: None,
+            workspace_request: None,
             extra_blocks: vec![],
             trigger_msg: MessageRef {
                 channel: make_channel("T"),
@@ -1495,7 +1489,7 @@ mod tests {
     ) -> Vec<RecordedDispatch> {
         let mock = Arc::new(MockDispatchTarget::new());
         let target: Arc<dyn DispatchTarget> = mock.clone();
-        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter::default());
         let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(msgs.len().max(1));
         for m in msgs {
             tx.send(m).await.unwrap();
@@ -1517,6 +1511,34 @@ mod tests {
         mock.calls()
     }
 
+    async fn run_consumer_with_mocks(
+        msgs: Vec<BufferedMessage>,
+    ) -> (Arc<MockDispatchTarget>, Arc<MockChatAdapter>) {
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter = Arc::new(MockChatAdapter::default());
+        let adapter_dyn: Arc<dyn ChatAdapter> = adapter.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(msgs.len().max(1));
+        for m in msgs {
+            tx.send(m).await.unwrap();
+        }
+        drop(tx);
+
+        consumer_loop(
+            "mock:T".into(),
+            make_channel("T"),
+            rx,
+            target,
+            adapter_dyn,
+            10,
+            24_000,
+            Duration::from_secs(60),
+        )
+        .await;
+
+        (mock, adapter)
+    }
+
     #[tokio::test]
     async fn consumer_dispatches_single_message_as_one_batch() {
         let calls = run_consumer_with_messages(vec![make_msg("hi", 10)], 10, 24_000).await;
@@ -1524,6 +1546,48 @@ mod tests {
         // pack_arrival_event with no extra_blocks → delimiter + prompt = 2 blocks.
         assert_eq!(calls[0].block_count, 2);
         assert!(!calls[0].other_bot_present);
+    }
+
+    #[tokio::test]
+    async fn consumer_rejects_session_directive_in_existing_batch() {
+        let (mock, adapter) =
+            run_consumer_with_mocks(vec![make_msg("[[ws:foo]] do work", 10)]).await;
+
+        assert!(mock.calls().is_empty());
+        assert!(mock.ensure_workspaces().is_empty());
+        assert!(adapter
+            .sent_messages()
+            .iter()
+            .any(|msg| msg.contains("session directives are only allowed")));
+    }
+
+    #[tokio::test]
+    async fn consumer_rejects_unknown_session_directive_before_agent_turn() {
+        let (mock, adapter) =
+            run_consumer_with_mocks(vec![make_msg("[[wz:foo]] do work", 10)]).await;
+
+        assert!(mock.calls().is_empty());
+        assert!(mock.ensure_workspaces().is_empty());
+        assert!(adapter
+            .sent_messages()
+            .iter()
+            .any(|msg| msg.contains("unknown session directive: wz")));
+    }
+
+    #[tokio::test]
+    async fn consumer_passes_adapter_workspace_to_ensure_session() {
+        let mut msg = make_msg("do work", 10);
+        msg.workspace_request = Some(WorkspaceRequest::Existing("/workspace/foo".to_string()));
+
+        let (mock, _adapter) = run_consumer_with_mocks(vec![msg]).await;
+
+        assert_eq!(mock.calls().len(), 1);
+        assert_eq!(
+            mock.ensure_workspaces(),
+            vec![Some(WorkspaceRequest::Existing(
+                "/workspace/foo".to_string()
+            ))]
+        );
     }
 
     #[tokio::test]
@@ -1560,7 +1624,7 @@ mod tests {
         // "all senders dropped" branch.
         let mock = Arc::new(MockDispatchTarget::new());
         let target: Arc<dyn DispatchTarget> = mock.clone();
-        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter::default());
         let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(1);
         let consumer = tokio::spawn(consumer_loop(
             "mock:T".into(),
@@ -1598,7 +1662,7 @@ mod tests {
             BatchGrouping::Thread,
             DEFAULT_CONSUMER_IDLE_TIMEOUT,
         );
-        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter::default());
 
         let key = "mock:T".to_string();
         let parked = {

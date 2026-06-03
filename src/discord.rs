@@ -2,7 +2,7 @@ use crate::acp::protocol::ConfigOption;
 use crate::acp::ContentBlock;
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
-use crate::config::{AllowBots, AllowUsers, CwdDirectiveMode, SttConfig};
+use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::format;
 use crate::media;
 use crate::remind::{self, ReminderStore};
@@ -673,27 +673,46 @@ impl EventHandler for Handler {
             return;
         }
 
-        let (mut cwd_request, prompt) = match AdapterRouter::extract_cwd_directive(&prompt) {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                let ch = ChannelRef {
-                    platform: "discord".into(),
-                    channel_id: msg.channel_id.get().to_string(),
-                    thread_id: None,
-                    parent_id: thread_parent_id.clone(),
-                    origin_event_id: None,
-                };
-                let msg = format!(
-                    "⚠️ {}",
-                    crate::error_display::format_user_error(&e.to_string())
-                );
-                let _ = adapter.send_message(&ch, &msg).await;
-                error!("cwd directive parse error before thread creation: {e}");
-                return;
-            }
-        };
+        let (mut session_directives, prompt) =
+            match AdapterRouter::parse_session_directives(&prompt) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    let ch = ChannelRef {
+                        platform: "discord".into(),
+                        channel_id: msg.channel_id.get().to_string(),
+                        thread_id: None,
+                        parent_id: thread_parent_id.clone(),
+                        origin_event_id: None,
+                    };
+                    let msg = format!(
+                        "⚠️ {}",
+                        crate::error_display::format_user_error(&e.to_string())
+                    );
+                    let _ = adapter.send_message(&ch, &msg).await;
+                    error!("session directive parse error before thread creation: {e}");
+                    return;
+                }
+            };
 
-        let cwd_mode = self.dispatcher.cwd_directive_mode();
+        if in_thread && session_directives.has_any() {
+            let ch = ChannelRef {
+                platform: "discord".into(),
+                channel_id: msg.channel_id.get().to_string(),
+                thread_id: None,
+                parent_id: thread_parent_id.clone(),
+                origin_event_id: None,
+            };
+            let _ = adapter
+                .send_message(
+                    &ch,
+                    "⚠️ session directives are only allowed when starting a new thread; start a new thread to change workspace or title",
+                )
+                .await;
+            let _ = adapter.add_reaction(&discord_msg_ref(&msg), "❌").await;
+            error!("session directive used in existing Discord thread");
+            return;
+        }
+
         if !in_thread && !is_dm {
             let ch = ChannelRef {
                 platform: "discord".into(),
@@ -702,18 +721,17 @@ impl EventHandler for Handler {
                 parent_id: None,
                 origin_event_id: None,
             };
-            if matches!(cwd_mode, CwdDirectiveMode::Off | CwdDirectiveMode::Required)
-                || cwd_request.is_some()
+            match self
+                .dispatcher
+                .prepare_workspace_request(session_directives.workspace.as_ref())
             {
-                match self.dispatcher.prepare_cwd_request(cwd_request.as_ref()) {
-                    Ok(prepared) => cwd_request = prepared,
-                    Err(e) => {
-                        let user_msg = crate::error_display::format_user_error(&e.to_string());
-                        let _ = adapter.send_message(&ch, &format!("⚠️ {user_msg}")).await;
-                        let _ = adapter.add_reaction(&discord_msg_ref(&msg), "❌").await;
-                        error!("cwd directive preflight failed before thread creation: {e}");
-                        return;
-                    }
+                Ok(prepared) => session_directives.workspace = prepared,
+                Err(e) => {
+                    let user_msg = crate::error_display::format_user_error(&e.to_string());
+                    let _ = adapter.send_message(&ch, &format!("⚠️ {user_msg}")).await;
+                    let _ = adapter.add_reaction(&discord_msg_ref(&msg), "❌").await;
+                    error!("workspace directive preflight failed before thread creation: {e}");
+                    return;
                 }
             }
         }
@@ -854,6 +872,7 @@ impl EventHandler for Handler {
             "processing"
         );
 
+        let thread_title = session_directives.title.clone();
         let thread_channel = if in_thread || is_dm {
             // DMs use the DM channel directly (no threads in DMs).
             ChannelRef {
@@ -864,7 +883,8 @@ impl EventHandler for Handler {
                 origin_event_id: None,
             }
         } else {
-            match get_or_create_thread(&ctx, &adapter, &msg, &prompt).await {
+            match get_or_create_thread(&ctx, &adapter, &msg, &prompt, thread_title.as_deref()).await
+            {
                 Ok(ch) => ch,
                 Err(e) => {
                     error!("failed to create thread: {e}");
@@ -929,7 +949,7 @@ impl EventHandler for Handler {
                 sender_json,
                 sender_name,
                 prompt,
-                cwd_request,
+                workspace_request: session_directives.workspace,
                 extra_blocks,
                 trigger_msg,
                 arrived_at: std::time::Instant::now(),
@@ -2068,6 +2088,7 @@ async fn get_or_create_thread(
     adapter: &Arc<dyn ChatAdapter>,
     msg: &Message,
     prompt: &str,
+    explicit_title: Option<&str>,
 ) -> anyhow::Result<ChannelRef> {
     let channel = msg.channel_id.to_channel(&ctx.http).await?;
     if let serenity::model::channel::Channel::Guild(ref gc) = channel {
@@ -2083,7 +2104,7 @@ async fn get_or_create_thread(
         }
     }
 
-    let thread_name = format::shorten_thread_name(prompt);
+    let thread_name = thread_name_for_prompt(prompt, explicit_title);
     let parent = ChannelRef {
         platform: "discord".into(),
         channel_id: msg.channel_id.get().to_string(),
@@ -2128,6 +2149,12 @@ async fn get_or_create_thread(
         }
         Err(e) => Err(e),
     }
+}
+
+fn thread_name_for_prompt(prompt: &str, explicit_title: Option<&str>) -> String {
+    explicit_title
+        .map(format::shorten_thread_name)
+        .unwrap_or_else(|| format::shorten_thread_name(prompt))
 }
 
 /// Detect Discord's "A thread has already been created for this message" error
@@ -2348,6 +2375,22 @@ fn turn_limit_warning_present(messages: &[(bool, &str)]) -> bool {
 mod tests {
     use super::*;
     use crate::bot_turns::{TurnResult, BOT_TURN_LIMIT_WARNING_PREFIX, HARD_BOT_TURN_LIMIT};
+
+    #[test]
+    fn thread_name_prefers_explicit_title() {
+        assert_eq!(
+            thread_name_for_prompt("this prompt should not win", Some("修 bug")),
+            "修 bug"
+        );
+    }
+
+    #[test]
+    fn thread_name_uses_prompt_when_title_absent() {
+        assert_eq!(
+            thread_name_for_prompt("Fix the login bug and add tests", None),
+            "Fix the login bug and add tests"
+        );
+    }
 
     // --- resolve_mentions tests ---
 
