@@ -259,6 +259,21 @@ impl SessionPool {
         self.validate_existing_workspace_path(&requested, &root)
     }
 
+    fn validate_persisted_workdir(&self, existing: &str) -> Result<String> {
+        let Some(root) = self.workspace_root() else {
+            return Ok(existing.to_string());
+        };
+        let requested = PathBuf::from(existing);
+        if !requested.is_dir() {
+            return Err(anyhow!(
+                "workspace no longer exists: {}; recreate it or start a new thread with [[ws:<name>]]",
+                requested.display()
+            ));
+        }
+        self.validate_existing_workspace_path(&requested, &root)
+            .map_err(|e| anyhow!("persisted workspace is invalid: {existing}: {e}"))
+    }
+
     pub fn prepare_workspace_request(
         &self,
         workspace_request: Option<&WorkspaceRequest>,
@@ -299,7 +314,7 @@ impl SessionPool {
                         "thread already has workspace {existing}; start a new thread to change workspace"
                     ));
                 }
-                return Ok(existing);
+                return self.validate_persisted_workdir(&existing);
             }
 
             if let Some(requested) = workspace_request {
@@ -869,6 +884,39 @@ mod tests {
             .to_string()
             .contains("use [[ws:missing-project --create]]"));
         assert!(!project_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn resolve_working_dir_rejects_deleted_persisted_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspaces");
+        let project_dir = root.join("project");
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        std::fs::create_dir_all(&home_dir).expect("home dir");
+
+        let pool = with_home(&home_dir, || {
+            SessionPool::new(
+                agent_config(tmp.path()),
+                1,
+                false,
+                workspace_config(&root, true),
+            )
+        });
+
+        let thread_id = "discord:test-thread";
+        pool.resolve_working_dir(
+            thread_id,
+            Some(&WorkspaceRequest::Existing("project".to_string())),
+        )
+        .await
+        .expect("workspace should bind");
+
+        std::fs::remove_dir(&project_dir).expect("delete project workspace");
+
+        let err = pool.resolve_working_dir(thread_id, None).await.unwrap_err();
+        assert!(err.to_string().contains("workspace no longer exists"));
+        assert!(err.to_string().contains("project"));
     }
 
     #[test]
