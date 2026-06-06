@@ -3,6 +3,13 @@
 {{- $d := dict "ctx" $ "agent" $name "cfg" $cfg }}
 {{- $pvcEnabled := not (eq (include "openab.persistenceEnabled" $cfg) "false") }}
 {{- $workspace := ($cfg.workspace | default dict) }}
+{{- $threadBinding := $.Values.threadBinding | default dict }}
+{{- $threadBindingForAgent := false }}
+{{- range $profile := ($threadBinding.channelProfiles | default list) }}
+{{- if has $name ($profile.allowedAgents | default list) }}
+{{- $threadBindingForAgent = true }}
+{{- end }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -22,7 +29,11 @@ spec:
   template:
     metadata:
       annotations:
+        {{- if and $threadBinding.enabled $threadBindingForAgent }}
+        checksum/config: {{ dict "agent" $cfg "threadBinding" ($.Values.threadBinding | default dict) | toJson | sha256sum }}
+        {{- else }}
         checksum/config: {{ $cfg | toJson | sha256sum }}
+        {{- end }}
       labels:
         {{- include "openab.selectorLabels" $d | nindent 8 }}
     spec:

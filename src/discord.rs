@@ -1,17 +1,20 @@
 use crate::acp::protocol::ConfigOption;
 use crate::acp::ContentBlock;
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::adapter::{
+    AdapterRouter, ChannelRef, ChatAdapter, MessageRef, OutboundAttachment, SenderContext,
+};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::format;
 use crate::media;
 use crate::remind::{self, ReminderStore};
+use crate::thread_binding::{PrimaryUpdateActor, ThreadBindingContext};
 use async_trait::async_trait;
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
     CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
-    CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage,
-    GetMessages,
+    CreateMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread,
+    EditMessage, GetMessages,
 };
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
@@ -110,6 +113,40 @@ impl ChatAdapter for DiscordAdapter {
                 self.send_message(channel, content).await
             }
         }
+    }
+
+    async fn send_message_with_attachments(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        attachments: &[OutboundAttachment],
+        reply_to_message_id: Option<&str>,
+    ) -> anyhow::Result<MessageRef> {
+        let ch_id: u64 = Self::resolve_channel(channel).parse()?;
+        let mut builder = CreateMessage::new().content(content);
+
+        if let Some(reply_to_message_id) = reply_to_message_id {
+            let msg_id: u64 = reply_to_message_id.parse().unwrap_or(0);
+            if msg_id != 0 {
+                builder =
+                    builder.reference_message((ChannelId::new(ch_id), MessageId::new(msg_id)));
+            }
+        }
+
+        for attachment in attachments {
+            builder = builder.add_file(CreateAttachment::bytes(
+                attachment.bytes.clone(),
+                attachment.filename.clone(),
+            ));
+        }
+
+        let msg = ChannelId::new(ch_id)
+            .send_message(&self.http, builder)
+            .await?;
+        Ok(MessageRef {
+            channel: channel.clone(),
+            message_id: msg.id.to_string(),
+        })
     }
 
     async fn delete_message(&self, msg: &MessageRef) -> anyhow::Result<()> {
@@ -319,11 +356,7 @@ impl Handler {
 
         (involved, other_bot_present)
     }
-}
-
-#[serenity::async_trait]
-impl EventHandler for Handler {
-    async fn message(&self, ctx: Context, msg: Message) {
+    async fn handle_message_event(&self, ctx: Context, msg: Message) {
         let bot_id = ctx.cache.current_user().id;
 
         // Early multibot detection: cache that another bot is present.
@@ -603,12 +636,43 @@ impl EventHandler for Handler {
             return;
         }
 
+        let inbound_binding_context = if in_thread {
+            Some(ThreadBindingContext {
+                platform: "discord".to_string(),
+                guild_id: msg.guild_id.map(|id| id.get().to_string()),
+                parent_channel_id: thread_parent_id.clone(),
+                thread_id: msg.channel_id.get().to_string(),
+                created_by_user_id: Some(msg.author.id.get().to_string()),
+                trigger_message_id: Some(msg.id.get().to_string()),
+            })
+        } else {
+            None
+        };
+        let mentions_profile_bot = if let Some(binding_context) = inbound_binding_context.as_ref() {
+            match self
+                .router
+                .pool()
+                .message_mentions_profile_agent(binding_context, &msg.content)
+            {
+                Ok(value) => value,
+                Err(e) => {
+                    tracing::debug!(error = %e, "failed to inspect ChannelProfile mentions");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
         // User message gating (mirrors Slack's AllowUsers logic).
         // Mentions: always require @mention, even in bot's own threads.
         // Involved (default): skip @mention if the bot owns the thread
         //   (Option A) OR has previously posted in it (Option B).
         // MultibotMentions: same as Involved, but if other bots are also
         //   in the thread, require @mention to avoid all bots responding.
+        // Primary: in bound threads, route unmentioned user messages only to
+        // the current primary bot. Mentions of any ChannelProfile bot are not
+        // treated as unmentioned follow-ups.
         // DMs are treated as implicit @mention (mirrors Slack behavior).
         if !is_mentioned && !is_dm {
             match self.allow_user_messages {
@@ -651,6 +715,26 @@ impl EventHandler for Handler {
                         return;
                     }
                 }
+                AllowUsers::Primary => {
+                    if !in_thread || mentions_profile_bot {
+                        return;
+                    }
+                    let Some(binding_context) = inbound_binding_context.as_ref() else {
+                        return;
+                    };
+                    match self
+                        .router
+                        .pool()
+                        .current_agent_is_primary(binding_context, &bot_id.to_string())
+                    {
+                        Ok(true) => {}
+                        Ok(false) => return,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "primary bot lookup failed, ignoring");
+                            return;
+                        }
+                    }
+                }
             }
         }
 
@@ -666,10 +750,88 @@ impl EventHandler for Handler {
             return;
         }
 
-        let prompt = resolve_mentions(&msg.content, bot_id, &self.allowed_role_ids);
+        let (handover_directive, raw_prompt) = match parse_handover_directives(&msg.content) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                let ch = ChannelRef {
+                    platform: "discord".into(),
+                    channel_id: msg.channel_id.get().to_string(),
+                    thread_id: None,
+                    parent_id: thread_parent_id.clone(),
+                    origin_event_id: None,
+                };
+                let msg = format!(
+                    "⚠️ {}",
+                    crate::error_display::format_user_error(&e.to_string())
+                );
+                let _ = adapter.send_message(&ch, &msg).await;
+                error!("handover directive parse error: {e}");
+                return;
+            }
+        };
+
+        let had_handover = handover_directive.is_some();
+        if let Some(handover) = handover_directive {
+            if handover.target_discord_user_id != bot_id.to_string() {
+                return;
+            }
+            let Some(binding_context) = inbound_binding_context.as_ref() else {
+                let ch = ChannelRef {
+                    platform: "discord".into(),
+                    channel_id: msg.channel_id.get().to_string(),
+                    thread_id: None,
+                    parent_id: thread_parent_id.clone(),
+                    origin_event_id: None,
+                };
+                let _ = adapter
+                    .send_message(&ch, "⚠️ handover is only allowed inside a bound thread")
+                    .await;
+                return;
+            };
+            let actor = if msg.author.bot {
+                PrimaryUpdateActor::Bot {
+                    user_id: msg.author.id.get().to_string(),
+                }
+            } else {
+                PrimaryUpdateActor::Human {
+                    user_id: msg.author.id.get().to_string(),
+                }
+            };
+            if let Err(e) = self.router.pool().handover_primary(
+                binding_context,
+                &handover.target_discord_user_id,
+                actor,
+                &msg.id.get().to_string(),
+            ) {
+                let ch = ChannelRef {
+                    platform: "discord".into(),
+                    channel_id: msg.channel_id.get().to_string(),
+                    thread_id: None,
+                    parent_id: thread_parent_id.clone(),
+                    origin_event_id: None,
+                };
+                let user_msg = crate::error_display::format_user_error(&e.to_string());
+                let _ = adapter.send_message(&ch, &format!("⚠️ {user_msg}")).await;
+                let _ = adapter.add_reaction(&discord_msg_ref(&msg), "❌").await;
+                error!("handover failed: {e}");
+                return;
+            }
+        }
+
+        let prompt = resolve_mentions(&raw_prompt, bot_id, &self.allowed_role_ids);
 
         // No text and no attachments → skip
         if prompt.is_empty() && msg.attachments.is_empty() {
+            if had_handover {
+                let ch = ChannelRef {
+                    platform: "discord".into(),
+                    channel_id: msg.channel_id.get().to_string(),
+                    thread_id: None,
+                    parent_id: thread_parent_id.clone(),
+                    origin_event_id: None,
+                };
+                let _ = adapter.send_message(&ch, "✅ handover accepted").await;
+            }
             return;
         }
 
@@ -694,7 +856,7 @@ impl EventHandler for Handler {
                 }
             };
 
-        if in_thread && session_directives.has_any() {
+        if in_thread && session_directives.title.is_some() {
             let ch = ChannelRef {
                 platform: "discord".into(),
                 channel_id: msg.channel_id.get().to_string(),
@@ -705,11 +867,11 @@ impl EventHandler for Handler {
             let _ = adapter
                 .send_message(
                     &ch,
-                    "⚠️ session directives are only allowed when starting a new thread; start a new thread to change workspace or title",
+                    "⚠️ title directives are only allowed when starting a new thread",
                 )
                 .await;
             let _ = adapter.add_reaction(&discord_msg_ref(&msg), "❌").await;
-            error!("session directive used in existing Discord thread");
+            error!("title directive used in existing Discord thread");
             return;
         }
 
@@ -911,6 +1073,18 @@ impl EventHandler for Handler {
         }
 
         let trigger_msg = discord_msg_ref(&msg);
+        let thread_binding_context = if thread_channel.parent_id.is_some() {
+            Some(ThreadBindingContext {
+                platform: "discord".to_string(),
+                guild_id: msg.guild_id.map(|id| id.get().to_string()),
+                parent_channel_id: thread_channel.parent_id.clone(),
+                thread_id: thread_channel.channel_id.clone(),
+                created_by_user_id: Some(msg.author.id.get().to_string()),
+                trigger_message_id: Some(msg.id.get().to_string()),
+            })
+        } else {
+            None
+        };
 
         // Per-thread streaming: check if another bot is present in this thread
         let other_bot_present_flag = {
@@ -950,6 +1124,7 @@ impl EventHandler for Handler {
                 sender_name,
                 prompt,
                 workspace_request: session_directives.workspace,
+                thread_binding_context,
                 extra_blocks,
                 trigger_msg,
                 arrived_at: std::time::Instant::now(),
@@ -963,6 +1138,13 @@ impl EventHandler for Handler {
                 error!("dispatcher submit error: {e}");
             }
         });
+    }
+}
+
+#[serenity::async_trait]
+impl EventHandler for Handler {
+    async fn message(&self, ctx: Context, msg: Message) {
+        self.handle_message_event(ctx, msg).await;
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
@@ -2171,6 +2353,85 @@ fn is_thread_already_exists_error(err: &anyhow::Error) -> bool {
 
 static ROLE_MENTION_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"<@&\d+>").unwrap());
+static HANDOVER_USER_MENTION_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"^<@!?(\d+)>$").unwrap());
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HandoverDirective {
+    target_discord_user_id: String,
+}
+
+fn parse_handover_directives(content: &str) -> anyhow::Result<(Option<HandoverDirective>, String)> {
+    let mut cleaned = String::with_capacity(content.len());
+    let mut rest = content;
+    let mut directive: Option<HandoverDirective> = None;
+
+    while let Some(open_idx) = rest.find("[[") {
+        cleaned.push_str(&rest[..open_idx]);
+        let after_open = &rest[open_idx + 2..];
+        let Some(close_idx) = after_open.find("]]") else {
+            cleaned.push_str(&rest[open_idx..]);
+            return Ok((directive, cleaned));
+        };
+        let inner = after_open[..close_idx].trim();
+        let after_directive = &after_open[close_idx + 2..];
+
+        let is_handover = inner == "handover"
+            || inner
+                .strip_prefix("handover")
+                .is_some_and(|tail| tail.chars().next().is_some_and(char::is_whitespace));
+        if !is_handover {
+            cleaned.push_str(&rest[open_idx..open_idx + 2 + close_idx + 2]);
+            rest = after_directive;
+            continue;
+        }
+
+        if directive.is_some() {
+            return Err(anyhow::anyhow!(
+                "multiple handover directives are not allowed"
+            ));
+        }
+        let target = inner.strip_prefix("handover").unwrap_or_default().trim();
+        if target.is_empty() {
+            return Err(anyhow::anyhow!("empty handover target"));
+        }
+        let mut parts = target.split_whitespace();
+        let Some(token) = parts.next() else {
+            return Err(anyhow::anyhow!("empty handover target"));
+        };
+        if parts.next().is_some() {
+            return Err(anyhow::anyhow!("multiple handover targets are not allowed"));
+        }
+        let Some(captures) = HANDOVER_USER_MENTION_RE.captures(token) else {
+            return Err(anyhow::anyhow!(
+                "handover target must be a Discord bot user mention"
+            ));
+        };
+        directive = Some(HandoverDirective {
+            target_discord_user_id: captures
+                .get(1)
+                .expect("capture exists")
+                .as_str()
+                .to_string(),
+        });
+        rest = after_directive;
+    }
+
+    cleaned.push_str(rest);
+    Ok((directive, clean_control_stripped_prompt(&cleaned)))
+}
+
+fn clean_control_stripped_prompt(prompt: &str) -> String {
+    let lines: Vec<&str> = prompt.lines().collect();
+    let Some(first) = lines.iter().position(|line| !line.trim().is_empty()) else {
+        return String::new();
+    };
+    let last = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .unwrap();
+    lines[first..=last].join("\n").trim().to_string()
+}
 
 fn resolve_mentions(content: &str, bot_id: UserId, allowed_role_ids: &HashSet<u64>) -> String {
     // 1. Strip the bot's own trigger mention
@@ -2352,7 +2613,21 @@ fn should_process_user_message(
             }
             !other_bot_present
         }
+        AllowUsers::Primary => false,
     }
+}
+
+#[cfg(test)]
+fn should_process_primary_user_message(
+    is_mentioned: bool,
+    in_thread: bool,
+    is_current_primary: bool,
+    mentions_profile_bot: bool,
+) -> bool {
+    if is_mentioned {
+        return true;
+    }
+    in_thread && is_current_primary && !mentions_profile_bot
 }
 
 /// Returns true if any bot message in `messages` contains a turn limit warning.
@@ -2450,6 +2725,44 @@ mod tests {
         let roles: HashSet<u64> = [999].into_iter().collect();
         let result = resolve_mentions("<@&999> check <@&888>", bot_id, &roles);
         assert_eq!(result, "check @(role)");
+    }
+
+    #[test]
+    fn parse_handover_accepts_user_mention() {
+        let (directive, prompt) =
+            parse_handover_directives("[[handover <@1234567890>]] please continue").expect("parse");
+        assert_eq!(
+            directive.expect("directive").target_discord_user_id,
+            "1234567890"
+        );
+        assert_eq!(prompt, "please continue");
+    }
+
+    #[test]
+    fn parse_handover_accepts_legacy_user_mention() {
+        let (directive, prompt) =
+            parse_handover_directives("before [[handover <@!1234567890>]] after").expect("parse");
+        assert_eq!(
+            directive.expect("directive").target_discord_user_id,
+            "1234567890"
+        );
+        assert_eq!(prompt, "before  after");
+    }
+
+    #[test]
+    fn parse_handover_rejects_alias_role_empty_and_multiple_targets() {
+        assert!(parse_handover_directives("[[handover B]]").is_err());
+        assert!(parse_handover_directives("[[handover <@&123>]]").is_err());
+        assert!(parse_handover_directives("[[handover]]").is_err());
+        assert!(parse_handover_directives("[[handover <@123> <@456>]]").is_err());
+    }
+
+    #[test]
+    fn parse_handover_preserves_other_directives() {
+        let (directive, prompt) =
+            parse_handover_directives("[[ws:foo]] [[handover <@123>]] do work").expect("parse");
+        assert_eq!(directive.expect("directive").target_discord_user_id, "123");
+        assert_eq!(prompt, "[[ws:foo]]  do work");
     }
 
     #[test]
@@ -2749,6 +3062,40 @@ mod tests {
             true,  // in_thread
             true,  // involved
             false, // other_bot_present
+        ));
+    }
+
+    #[test]
+    fn primary_mode_no_mention_routes_only_to_current_primary() {
+        assert!(should_process_primary_user_message(
+            false, // is_mentioned
+            true,  // in_thread
+            true,  // is_current_primary
+            false, // mentions_profile_bot
+        ));
+        assert!(!should_process_primary_user_message(
+            false, true, false, false
+        ));
+    }
+
+    #[test]
+    fn primary_mode_profile_bot_mention_is_not_default_routed() {
+        assert!(!should_process_primary_user_message(
+            false, // this bot is not mentioned
+            true, true, true, // another ChannelProfile bot is mentioned
+        ));
+        assert!(should_process_primary_user_message(
+            true, // explicit mention always wins for this bot
+            true, false, true,
+        ));
+    }
+
+    #[test]
+    fn primary_mode_main_channel_no_mention_rejected() {
+        assert!(!should_process_primary_user_message(
+            false, // is_mentioned
+            false, // in_thread
+            true, false,
         ));
     }
 

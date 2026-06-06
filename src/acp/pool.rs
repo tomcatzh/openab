@@ -1,6 +1,9 @@
 use crate::acp::connection::AcpConnection;
 use crate::acp::protocol::ConfigOption;
-use crate::config::{AgentConfig, WorkspaceConfig, WorkspaceRequest};
+use crate::config::{AgentConfig, ThreadBindingConfig, WorkspaceConfig, WorkspaceRequest};
+use crate::thread_binding::{
+    PrimaryUpdateActor, ThreadBinding, ThreadBindingContext, ThreadBindingStore,
+};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -42,6 +45,7 @@ pub struct SessionPool {
     workdir_mapping_path: PathBuf,
     per_thread_workdir: bool,
     workspace: WorkspaceConfig,
+    thread_binding_store: Option<ThreadBindingStore>,
 }
 
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
@@ -73,6 +77,7 @@ impl SessionPool {
         max_sessions: usize,
         per_thread_workdir: bool,
         workspace: WorkspaceConfig,
+        thread_binding: ThreadBindingConfig,
     ) -> Self {
         let openab_dir = std::env::var("HOME")
             .map(PathBuf::from)
@@ -83,6 +88,13 @@ impl SessionPool {
         let workdir_mapping_path = openab_dir.join("thread_workdir_map.json");
         let suspended = Self::load_mapping(&mapping_path);
         let workdirs = Self::load_mapping(&workdir_mapping_path);
+        let thread_binding_store =
+            ThreadBindingStore::from_config(thread_binding, workspace.root.as_deref());
+        if let Some(store) = &thread_binding_store {
+            if let Err(e) = store.initialize() {
+                warn!(error = %e, "failed to initialize thread binding store");
+            }
+        }
         Self {
             state: RwLock::new(PoolState {
                 active: HashMap::new(),
@@ -98,11 +110,47 @@ impl SessionPool {
             workdir_mapping_path,
             per_thread_workdir,
             workspace,
+            thread_binding_store,
         }
     }
 
     pub fn workspace_enabled(&self) -> bool {
         self.workspace.root.is_some()
+    }
+
+    pub fn current_agent_is_primary(
+        &self,
+        binding_context: &ThreadBindingContext,
+        current_discord_user_id: &str,
+    ) -> Result<bool> {
+        let Some(store) = &self.thread_binding_store else {
+            return Ok(false);
+        };
+        store.current_agent_is_primary(binding_context, current_discord_user_id)
+    }
+
+    pub fn message_mentions_profile_agent(
+        &self,
+        binding_context: &ThreadBindingContext,
+        content: &str,
+    ) -> Result<bool> {
+        let Some(store) = &self.thread_binding_store else {
+            return Ok(false);
+        };
+        store.message_mentions_profile_agent(binding_context, content)
+    }
+
+    pub fn handover_primary(
+        &self,
+        binding_context: &ThreadBindingContext,
+        target_discord_user_id: &str,
+        actor: PrimaryUpdateActor,
+        message_id: &str,
+    ) -> Result<ThreadBinding> {
+        let Some(store) = &self.thread_binding_store else {
+            return Err(anyhow!("thread binding store is not enabled"));
+        };
+        store.handover_primary(binding_context, target_discord_user_id, actor, message_id)
     }
 
     fn load_mapping(path: &Path) -> HashMap<String, String> {
@@ -301,6 +349,7 @@ impl SessionPool {
         &self,
         thread_id: &str,
         workspace_request: Option<&WorkspaceRequest>,
+        binding_context: Option<&ThreadBindingContext>,
     ) -> Result<String> {
         if self.workspace_enabled() {
             let existing_workdir = {
@@ -309,12 +358,17 @@ impl SessionPool {
             };
 
             if let Some(existing) = existing_workdir {
+                let existing = self.validate_persisted_workdir(&existing)?;
                 if workspace_request.is_some() {
-                    return Err(anyhow!(
-                        "thread already has workspace {existing}; start a new thread to change workspace"
-                    ));
+                    let requested = self.validate_requested_workspace(
+                        workspace_request.expect("checked workspace_request is some"),
+                    )?;
+                    if requested == existing {
+                        return Ok(existing);
+                    }
+                    return Err(anyhow!("thread already has workspace {existing}; start a new thread to change workspace"));
                 }
-                return self.validate_persisted_workdir(&existing);
+                return Ok(existing);
             }
 
             if let Some(requested) = workspace_request {
@@ -327,8 +381,22 @@ impl SessionPool {
                 }
                 state.workdirs.insert(thread_id.to_string(), cwd.clone());
                 self.save_workdir_mapping(&state.workdirs);
+                if let (Some(store), Some(ctx)) = (&self.thread_binding_store, binding_context) {
+                    store.record_binding(ctx, requested.name(), &cwd)?;
+                }
                 info!(thread_id, working_dir = %cwd, "bound thread workspace");
                 return Ok(cwd);
+            }
+
+            if let (Some(store), Some(ctx)) = (&self.thread_binding_store, binding_context) {
+                if let Some(binding) = store.lookup_binding(ctx)? {
+                    let cwd = self.validate_persisted_workdir(&binding.resolved_cwd)?;
+                    let mut state = self.state.write().await;
+                    state.workdirs.insert(thread_id.to_string(), cwd.clone());
+                    self.save_workdir_mapping(&state.workdirs);
+                    info!(thread_id, working_dir = %cwd, "inherited shared thread workspace");
+                    return Ok(cwd);
+                }
             }
 
             if self.workspace.required {
@@ -350,10 +418,30 @@ impl SessionPool {
         Ok(self.config.working_dir.clone())
     }
 
+    pub async fn working_dir_for_thread(&self, thread_id: &str) -> Result<String> {
+        if let Some(existing) = {
+            let state = self.state.read().await;
+            state.workdirs.get(thread_id).cloned()
+        } {
+            return self.validate_persisted_workdir(&existing);
+        }
+
+        if self.per_thread_workdir {
+            let safe = Self::safe_thread_component(thread_id)?;
+            let dir = PathBuf::from(&self.config.working_dir)
+                .join("sessions")
+                .join(safe);
+            return Ok(dir.to_string_lossy().to_string());
+        }
+
+        Ok(self.config.working_dir.clone())
+    }
+
     pub async fn get_or_create(
         &self,
         thread_id: &str,
         workspace_request: Option<&WorkspaceRequest>,
+        binding_context: Option<&ThreadBindingContext>,
     ) -> Result<()> {
         let create_gate = {
             let mut state = self.state.write().await;
@@ -361,7 +449,7 @@ impl SessionPool {
         };
         let _create_guard = create_gate.lock().await;
         let working_dir = self
-            .resolve_working_dir(thread_id, workspace_request)
+            .resolve_working_dir(thread_id, workspace_request, binding_context)
             .await?;
 
         let (existing, saved_session_id) = {
@@ -726,7 +814,10 @@ impl SessionPool {
 #[cfg(test)]
 mod tests {
     use super::{get_or_insert_gate, remove_if_same_handle, SessionPool};
-    use crate::config::{AgentConfig, WorkspaceConfig, WorkspaceRequest};
+    use crate::config::{
+        AgentConfig, ChannelProfileConfig, ThreadBindingConfig, WorkspaceConfig, WorkspaceRequest,
+    };
+    use crate::thread_binding::ThreadBindingContext;
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;
@@ -747,6 +838,42 @@ mod tests {
         WorkspaceConfig {
             root: Some(root.to_string_lossy().to_string()),
             required,
+        }
+    }
+
+    fn thread_binding_config() -> ThreadBindingConfig {
+        ThreadBindingConfig::default()
+    }
+
+    fn thread_binding_config_with_profile(
+        root: &Path,
+        store_dir: &Path,
+        agent_name: &str,
+    ) -> ThreadBindingConfig {
+        ThreadBindingConfig {
+            enabled: true,
+            agent_name: Some(agent_name.to_string()),
+            store_dir: Some(store_dir.to_string_lossy().to_string()),
+            channel_profiles: vec![ChannelProfileConfig {
+                profile_id: "software-dev".to_string(),
+                guild_id: "111111111111111111".to_string(),
+                parent_channel_id: "222222222222222222".to_string(),
+                work_domain: "software-development".to_string(),
+                workspace_root: root.to_string_lossy().to_string(),
+                allowed_agents: vec!["codex".to_string(), "codex-reviewer".to_string()],
+                agents: Vec::new(),
+            }],
+        }
+    }
+
+    fn binding_context(thread_id: &str) -> ThreadBindingContext {
+        ThreadBindingContext {
+            platform: "discord".to_string(),
+            guild_id: Some("111111111111111111".to_string()),
+            parent_channel_id: Some("222222222222222222".to_string()),
+            thread_id: thread_id.to_string(),
+            created_by_user_id: Some("333333333333333333".to_string()),
+            trigger_message_id: Some("444444444444444444".to_string()),
         }
     }
 
@@ -837,6 +964,7 @@ mod tests {
                 1,
                 false,
                 workspace_config(&root, true),
+                thread_binding_config(),
             )
         });
 
@@ -845,6 +973,7 @@ mod tests {
             pool.resolve_working_dir(
                 "discord:test-thread",
                 Some(&WorkspaceRequest::Create("project".to_string())),
+                None,
             ),
         )
         .await
@@ -870,6 +999,7 @@ mod tests {
                 1,
                 false,
                 workspace_config(&root, true),
+                thread_binding_config(),
             )
         });
 
@@ -877,6 +1007,7 @@ mod tests {
             .resolve_working_dir(
                 "discord:test-thread",
                 Some(&WorkspaceRequest::Existing("missing-project".to_string())),
+                None,
             )
             .await
             .unwrap_err();
@@ -901,6 +1032,7 @@ mod tests {
                 1,
                 false,
                 workspace_config(&root, true),
+                thread_binding_config(),
             )
         });
 
@@ -908,13 +1040,17 @@ mod tests {
         pool.resolve_working_dir(
             thread_id,
             Some(&WorkspaceRequest::Existing("project".to_string())),
+            None,
         )
         .await
         .expect("workspace should bind");
 
         std::fs::remove_dir(&project_dir).expect("delete project workspace");
 
-        let err = pool.resolve_working_dir(thread_id, None).await.unwrap_err();
+        let err = pool
+            .resolve_working_dir(thread_id, None, None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("workspace no longer exists"));
         assert!(err.to_string().contains("project"));
     }
@@ -934,6 +1070,7 @@ mod tests {
                 1,
                 false,
                 workspace_config(&root, true),
+                thread_binding_config(),
             )
         });
 
@@ -961,6 +1098,7 @@ mod tests {
                 1,
                 false,
                 workspace_config(&root, true),
+                thread_binding_config(),
             )
         });
 
@@ -975,12 +1113,122 @@ mod tests {
         );
 
         let cwd = pool
-            .resolve_working_dir("discord:test-thread", Some(&prepared))
+            .resolve_working_dir("discord:test-thread", Some(&prepared), None)
             .await
             .expect("preflighted workspace should create session cwd");
 
         let expected = project_dir.canonicalize().expect("canonical project dir");
         assert_eq!(cwd, expected.to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn thread_binding_inherits_cwd_across_independent_homes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspaces");
+        let project_dir = root.join("openab-lab");
+        let store_dir = root.join(".openab");
+        let home_a = tmp.path().join("home-a");
+        let home_b = tmp.path().join("home-b");
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        std::fs::create_dir_all(&home_a).expect("home a");
+        std::fs::create_dir_all(&home_b).expect("home b");
+
+        let pool_a = with_home(&home_a, || {
+            SessionPool::new(
+                agent_config(tmp.path()),
+                1,
+                false,
+                workspace_config(&root, true),
+                thread_binding_config_with_profile(&root, &store_dir, "codex"),
+            )
+        });
+        let pool_b = with_home(&home_b, || {
+            SessionPool::new(
+                agent_config(tmp.path()),
+                1,
+                false,
+                workspace_config(&root, true),
+                thread_binding_config_with_profile(&root, &store_dir, "codex-reviewer"),
+            )
+        });
+        let ctx = binding_context("555555555555555555");
+        let thread_key = format!("discord:{}", ctx.thread_id);
+
+        let bound = pool_a
+            .resolve_working_dir(
+                &thread_key,
+                Some(&WorkspaceRequest::Existing("openab-lab".to_string())),
+                Some(&ctx),
+            )
+            .await
+            .expect("bot a should bind workspace");
+        let inherited = pool_b
+            .resolve_working_dir(&thread_key, None, Some(&ctx))
+            .await
+            .expect("bot b should inherit shared binding");
+
+        let expected = project_dir.canonicalize().expect("canonical project dir");
+        assert_eq!(bound, expected.to_string_lossy());
+        assert_eq!(inherited, expected.to_string_lossy());
+
+        let private_map =
+            std::fs::read_to_string(home_b.join(".openab").join("thread_workdir_map.json"))
+                .expect("bot b private workdir map");
+        let workdirs: HashMap<String, String> =
+            serde_json::from_str(&private_map).expect("parse workdir map");
+        assert_eq!(workdirs.get(&thread_key), Some(&inherited));
+    }
+
+    #[tokio::test]
+    async fn repeated_same_workspace_is_allowed_but_workspace_change_is_rejected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspaces");
+        let project_dir = root.join("openab-lab");
+        let other_dir = root.join("other");
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        std::fs::create_dir_all(&other_dir).expect("other dir");
+        std::fs::create_dir_all(&home_dir).expect("home dir");
+
+        let pool = with_home(&home_dir, || {
+            SessionPool::new(
+                agent_config(tmp.path()),
+                1,
+                false,
+                workspace_config(&root, true),
+                thread_binding_config(),
+            )
+        });
+        let thread_key = "discord:test-thread";
+        let first = pool
+            .resolve_working_dir(
+                thread_key,
+                Some(&WorkspaceRequest::Existing("openab-lab".to_string())),
+                None,
+            )
+            .await
+            .expect("initial bind");
+        let repeated = pool
+            .resolve_working_dir(
+                thread_key,
+                Some(&WorkspaceRequest::Existing("openab-lab".to_string())),
+                None,
+            )
+            .await
+            .expect("same workspace redeclaration should pass");
+
+        assert_eq!(repeated, first);
+
+        let err = pool
+            .resolve_working_dir(
+                thread_key,
+                Some(&WorkspaceRequest::Existing("other".to_string())),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("thread already has workspace"));
+        assert!(err.to_string().contains("openab-lab"));
     }
 
     #[test]
@@ -998,6 +1246,7 @@ mod tests {
                 1,
                 false,
                 workspace_config(&root, true),
+                thread_binding_config(),
             )
         });
 
@@ -1021,6 +1270,7 @@ mod tests {
                 1,
                 false,
                 WorkspaceConfig::default(),
+                thread_binding_config(),
             )
         });
 
@@ -1044,6 +1294,7 @@ mod tests {
                 1,
                 false,
                 workspace_config(&root, true),
+                thread_binding_config(),
             )
         });
 
@@ -1066,6 +1317,7 @@ mod tests {
                 1,
                 false,
                 workspace_config(&root, false),
+                thread_binding_config(),
             )
         });
 
@@ -1091,6 +1343,7 @@ mod tests {
                 1,
                 false,
                 workspace_config(&root, false),
+                thread_binding_config(),
             )
         });
 
@@ -1125,6 +1378,7 @@ mod tests {
                 1,
                 false,
                 workspace_config(&root, false),
+                thread_binding_config(),
             )
         });
 

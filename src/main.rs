@@ -16,6 +16,7 @@ mod remind;
 mod setup;
 mod slack;
 mod stt;
+mod thread_binding;
 mod timestamp;
 
 use adapter::AdapterRouter;
@@ -141,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.pool.max_sessions,
         cfg.pool.per_thread_workdir,
         cfg.workspace,
+        cfg.thread_binding,
     ));
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
@@ -160,9 +162,16 @@ async fn main() -> anyhow::Result<()> {
         info!(model = %cfg.stt.model, base_url = %cfg.stt.base_url, "STT enabled");
     }
 
+    let attachments_config = cfg
+        .discord
+        .as_ref()
+        .map(|discord| discord.agent_attachments.clone())
+        .unwrap_or_default();
+
     let router = Arc::new(AdapterRouter::new(
         pool.clone(),
         cfg.reactions,
+        attachments_config,
         cfg.markdown.tables,
         cfg.pool.prompt_hard_timeout_secs,
         cfg.pool.liveness_check_secs,

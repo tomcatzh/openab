@@ -1,11 +1,15 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::Serialize;
-use std::sync::Arc;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tracing::{error, warn};
 
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
-use crate::config::{ReactionsConfig, ToolDisplay, WorkspaceRequest};
+use crate::config::{AgentAttachmentsConfig, ReactionsConfig, ToolDisplay, WorkspaceRequest};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::markdown::{self, TableMode};
@@ -13,92 +17,369 @@ use crate::reactions::StatusReactionController;
 
 // --- Output directive parsing ---
 
-/// Parsed directives from agent output header block.
-/// Consecutive `[[key:value]]` lines at the start of output are directives.
+/// Parsed directives from agent output.
 #[derive(Default, Debug)]
 pub struct OutputDirectives {
     /// Message ID to reply to (Discord: message_reference)
     pub reply_to: Option<String>,
+    /// File paths requested for upload into the outbound platform message.
+    pub attachments: Vec<String>,
 }
 
-/// Parse `[[key:value]]` directives from the beginning of agent output.
+fn valid_reply_to_value(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= 64
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+}
+
+fn parse_output_directive_inner(inner: &str, directives: &mut OutputDirectives) -> bool {
+    let Some((key, value)) = inner.split_once(':') else {
+        return false;
+    };
+
+    match key.trim() {
+        "reply_to" => {
+            let v = value.trim();
+            if valid_reply_to_value(v) {
+                directives.reply_to = Some(v.to_string());
+            }
+        }
+        "attach" => {
+            let v = value.trim();
+            if !v.is_empty() {
+                directives.attachments.push(v.to_string());
+            }
+        }
+        _ => {
+            tracing::debug!(key = key.trim(), "unknown output directive ignored");
+        }
+    }
+
+    true
+}
+
+fn late_attach_has_safe_boundary(after_close: &str) -> bool {
+    after_close.is_empty() || after_close.starts_with('\n') || after_close.starts_with("\r\n")
+}
+
+fn parse_late_output_directive(
+    inner: &str,
+    after_close: &str,
+    directives: &mut OutputDirectives,
+) -> bool {
+    let Some((key, value)) = inner.split_once(':') else {
+        return false;
+    };
+
+    let key = key.trim();
+    let v = value.trim();
+    match key {
+        "reply_to" if valid_reply_to_value(v) => {
+            directives.reply_to = Some(v.to_string());
+            true
+        }
+        "attach" if !v.is_empty() && late_attach_has_safe_boundary(after_close) => {
+            directives.attachments.push(v.to_string());
+            true
+        }
+        _ => false,
+    }
+}
+
+fn strip_late_output_directives(content: &str, directives: &mut OutputDirectives) -> String {
+    let mut output = String::with_capacity(content.len());
+    let mut rest = content;
+
+    while let Some(open_pos) = rest.find("[[") {
+        output.push_str(&rest[..open_pos]);
+        let candidate = &rest[open_pos + 2..];
+        let Some(close_pos) = candidate.find("]]") else {
+            output.push_str(&rest[open_pos..]);
+            return output;
+        };
+
+        let inner = &candidate[..close_pos];
+        let after_close = &candidate[close_pos + 2..];
+
+        if parse_late_output_directive(inner, after_close, directives) {
+            rest = after_close;
+            if output.ends_with('\n') && rest.starts_with('\n') {
+                rest = &rest[1..];
+            }
+            if let Some(stripped) = rest.strip_prefix(' ') {
+                rest = stripped;
+            }
+            let before = output.chars().next_back();
+            let after = rest.chars().next();
+            if before.is_some_and(|c| !c.is_whitespace())
+                && after.is_some_and(|c| !c.is_whitespace())
+            {
+                output.push(' ');
+            }
+        } else {
+            output.push_str(&rest[open_pos..open_pos + 2 + close_pos + 2]);
+            rest = &candidate[close_pos + 2..];
+        }
+    }
+
+    output.push_str(rest);
+    output
+}
+
+/// Parse `[[key:value]]` directives from agent output.
+///
+/// The preferred form is a directive header at the beginning of output. For
+/// `reply_to` and newline-terminated `attach`, also accept a late directive
+/// inside final output because real agents often preface tool-mediated
+/// operations with a short explanation before the directive. This still runs
+/// only after the agent turn finishes, before final message creation.
 /// Returns parsed directives and the remaining content (directives stripped).
 pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
     let mut directives = OutputDirectives::default();
-    let mut content_start = 0;
-    let mut trailing_content: Option<&str> = None;
+    let mut content_start = 0usize;
+    let mut consumed_directive = false;
 
-    for line in content.lines() {
-        let trimmed = line.trim();
-        // Try to match [[key:value]] at the start of the line (lenient: allows trailing content)
-        if let Some(after_open) = trimmed.strip_prefix("[[") {
-            if let Some(close_pos) = after_open.find("]]") {
-                let inner = &after_open[..close_pos];
-                if let Some((key, value)) = inner.split_once(':') {
-                    match key.trim() {
-                        "reply_to" => {
-                            let v = value.trim();
-                            // Validate: non-empty, reasonable length, no whitespace/control chars
-                            if !v.is_empty()
-                                && v.len() <= 64
-                                && v.chars().all(|c| {
-                                    c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
-                                })
-                            {
-                                directives.reply_to = Some(v.to_string());
-                            }
-                        }
-                        _ => {
-                            tracing::debug!(key = key.trim(), "unknown output directive ignored");
-                        }
-                    }
-                    // Check for trailing content after ]]
-                    let remainder = after_open[close_pos + 2..].trim();
-                    if !remainder.is_empty() {
-                        trailing_content = Some(remainder);
-                        // Advance past this line
-                        content_start += line.len();
-                        if content.as_bytes().get(content_start) == Some(&b'\r') {
-                            content_start += 1;
-                        }
-                        if content.as_bytes().get(content_start) == Some(&b'\n') {
-                            content_start += 1;
-                        }
-                        break; // Trailing content ends directive header
-                    }
-                    // Advance past this line + its line ending (handles both \n and \r\n)
-                    content_start += line.len();
-                    if content.as_bytes().get(content_start) == Some(&b'\r') {
-                        content_start += 1;
-                    }
-                    if content.as_bytes().get(content_start) == Some(&b'\n') {
-                        content_start += 1;
-                    }
-                } else {
-                    // [[X]] without colon — not a directive, stop parsing
-                    break;
-                }
+    loop {
+        let rest = &content[content_start..];
+        let Some(after_open) = rest.strip_prefix("[[") else {
+            break;
+        };
+        let Some(close_pos) = after_open.find("]]") else {
+            break;
+        };
+        let inner = &after_open[..close_pos];
+        if !parse_output_directive_inner(inner, &mut directives) {
+            break;
+        }
+
+        consumed_directive = true;
+        content_start += 2 + close_pos + 2;
+
+        while content_start < content.len() {
+            let rest = &content[content_start..];
+            if let Some(stripped) = rest.strip_prefix("\r\n") {
+                content_start = content.len() - stripped.len();
+            } else if let Some(stripped) = rest.strip_prefix('\n') {
+                content_start = content.len() - stripped.len();
+            } else if rest.starts_with(' ') || rest.starts_with('\t') {
+                content_start += 1;
             } else {
-                // No closing ]] found — not a directive, stop parsing
                 break;
             }
-        } else {
+
+            if content[content_start..].starts_with("[[") {
+                break;
+            }
+            if !matches!(
+                content[content_start..].chars().next(),
+                Some(' ' | '\t' | '\n' | '\r')
+            ) {
+                break;
+            }
+        }
+
+        if !content[content_start..].starts_with("[[") {
             break;
         }
     }
 
-    let remaining = if let Some(trailing) = trailing_content {
-        if content_start < content.len() {
-            format!("{}\n{}", trailing, &content[content_start..])
-        } else {
-            trailing.to_string()
-        }
-    } else if content_start < content.len() {
-        content[content_start..].to_string()
+    let remaining = if consumed_directive {
+        content[content_start..]
+            .trim_start_matches([' ', '\t'])
+            .to_string()
     } else {
-        String::new()
+        content[content_start..].to_string()
     };
+    let remaining = strip_late_output_directives(&remaining, &mut directives);
     (directives, remaining)
+}
+
+fn attachment_warning(message: impl std::fmt::Display) -> String {
+    format!("⚠️ attachment skipped: {message}")
+}
+
+fn requested_attachment_path(raw_path: &str, base_dir: &Path) -> PathBuf {
+    let path = PathBuf::from(raw_path.trim());
+    if path.is_absolute() {
+        path
+    } else {
+        base_dir.join(path)
+    }
+}
+
+fn sanitize_attachment_filename(path: &Path, fallback_idx: usize) -> String {
+    let raw = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("attachment-{fallback_idx}"));
+
+    let mut out = String::with_capacity(raw.len().min(128));
+    for ch in raw.chars().take(128) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() || out == "." || out == ".." {
+        format!("attachment-{fallback_idx}")
+    } else {
+        out
+    }
+}
+
+pub(crate) fn prepare_output_attachments(
+    requested_paths: &[String],
+    config: &AgentAttachmentsConfig,
+    base_dir: &Path,
+) -> (Vec<OutboundAttachment>, Vec<String>) {
+    if requested_paths.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    if !config.enabled {
+        return (
+            Vec::new(),
+            vec![format!(
+                "⚠️ attachment upload is disabled for this bot; {} requested file(s) were not sent.",
+                requested_paths.len()
+            )],
+        );
+    }
+
+    if requested_paths.len() > config.max_files {
+        return (
+            Vec::new(),
+            vec![attachment_warning(format!(
+                "too many files requested ({} > {})",
+                requested_paths.len(),
+                config.max_files
+            ))],
+        );
+    }
+
+    let allowed_roots: Vec<PathBuf> = config
+        .allowed_paths
+        .iter()
+        .filter_map(|root| match fs::canonicalize(root) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                tracing::warn!(path = root, error = %e, "attachment allowlist root is unavailable");
+                None
+            }
+        })
+        .collect();
+
+    if allowed_roots.is_empty() {
+        return (
+            Vec::new(),
+            vec![attachment_warning(
+                "no valid attachment allowlist roots are configured",
+            )],
+        );
+    }
+
+    let mut attachments = Vec::new();
+    let mut warnings = Vec::new();
+    let mut total_bytes = 0u64;
+
+    for (idx, raw_path) in requested_paths.iter().enumerate() {
+        let display_path = raw_path.trim();
+        if display_path.is_empty() {
+            warnings.push(attachment_warning("empty path"));
+            continue;
+        }
+
+        let requested_path = requested_attachment_path(display_path, base_dir);
+        let canonical = match fs::canonicalize(&requested_path) {
+            Ok(path) => path,
+            Err(e) => {
+                warnings.push(attachment_warning(format!(
+                    "{} is missing or cannot be resolved ({e})",
+                    display_path
+                )));
+                continue;
+            }
+        };
+
+        if !allowed_roots.iter().any(|root| canonical.starts_with(root)) {
+            warnings.push(attachment_warning(format!(
+                "{} is outside the configured allowlist",
+                display_path
+            )));
+            continue;
+        }
+
+        let metadata = match fs::metadata(&canonical) {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                warnings.push(attachment_warning(format!(
+                    "{} cannot be inspected ({e})",
+                    display_path
+                )));
+                continue;
+            }
+        };
+
+        if !metadata.is_file() {
+            warnings.push(attachment_warning(format!(
+                "{display_path} is not a regular file"
+            )));
+            continue;
+        }
+
+        if metadata.len() > config.max_file_bytes {
+            warnings.push(attachment_warning(format!(
+                "{} is too large ({} > {} bytes)",
+                display_path,
+                metadata.len(),
+                config.max_file_bytes
+            )));
+            continue;
+        }
+
+        let bytes = match fs::read(&canonical) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warnings.push(attachment_warning(format!(
+                    "{} cannot be read ({e})",
+                    display_path
+                )));
+                continue;
+            }
+        };
+
+        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+        attachments.push(OutboundAttachment {
+            filename: sanitize_attachment_filename(&requested_path, idx + 1),
+            bytes,
+        });
+    }
+
+    if total_bytes > config.max_total_bytes {
+        warnings.push(attachment_warning(format!(
+            "total attachment size is too large ({} > {} bytes)",
+            total_bytes, config.max_total_bytes
+        )));
+        attachments.clear();
+    }
+
+    (attachments, warnings)
+}
+
+fn append_attachment_warnings(content: String, warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        return content;
+    }
+    let warning_block = warnings.join("\n");
+    if content.trim().is_empty() {
+        warning_block
+    } else {
+        format!("{content}\n\n{warning_block}")
+    }
 }
 
 // --- Platform-agnostic types ---
@@ -153,6 +434,13 @@ impl std::hash::Hash for ChannelRef {
 pub struct MessageRef {
     pub channel: ChannelRef,
     pub message_id: String,
+}
+
+/// A broker-validated outbound file upload.
+#[derive(Clone, Debug)]
+pub struct OutboundAttachment {
+    pub filename: String,
+    pub bytes: Vec<u8>,
 }
 
 /// Bundles per-message parameters for `AdapterRouter::handle_message`.
@@ -264,6 +552,35 @@ pub trait ChatAdapter: Send + Sync + 'static {
         self.send_message(channel, content).await
     }
 
+    /// Send a message with already validated file attachments.
+    ///
+    /// Default: non-attachment adapters strip the directives and return a
+    /// visible warning instead of trying to expose local file paths.
+    async fn send_message_with_attachments(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        attachments: &[OutboundAttachment],
+        reply_to_message_id: Option<&str>,
+    ) -> Result<MessageRef> {
+        let warning = format!(
+            "⚠️ attachment upload is not supported on {} for {} requested file(s).",
+            self.platform(),
+            attachments.len()
+        );
+        let content = if content.trim().is_empty() {
+            warning
+        } else {
+            format!("{content}\n\n{warning}")
+        };
+        if let Some(reply_to_message_id) = reply_to_message_id {
+            self.send_message_with_reply(channel, &content, reply_to_message_id)
+                .await
+        } else {
+            self.send_message(channel, &content).await
+        }
+    }
+
     /// Delete a message. Used to remove streaming placeholders when reply_to is set.
     /// Default: edits to zero-width space (fallback for platforms without delete support).
     async fn delete_message(&self, msg: &MessageRef) -> Result<()> {
@@ -287,6 +604,7 @@ pub trait ChatAdapter: Send + Sync + 'static {
 pub struct AdapterRouter {
     pool: Arc<SessionPool>,
     reactions_config: ReactionsConfig,
+    attachments_config: AgentAttachmentsConfig,
     table_mode: TableMode,
     prompt_hard_timeout: std::time::Duration,
     /// Polling cadence for the recv-loop liveness check (#732).
@@ -297,6 +615,7 @@ impl AdapterRouter {
     pub fn new(
         pool: Arc<SessionPool>,
         reactions_config: ReactionsConfig,
+        attachments_config: AgentAttachmentsConfig,
         table_mode: TableMode,
         prompt_hard_timeout_secs: u64,
         liveness_check_secs: u64,
@@ -313,6 +632,7 @@ impl AdapterRouter {
         Self {
             pool,
             reactions_config,
+            attachments_config,
             table_mode,
             prompt_hard_timeout: std::time::Duration::from_secs(prompt_hard_timeout_secs),
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
@@ -471,7 +791,7 @@ impl AdapterRouter {
 
         if let Err(e) = self
             .pool
-            .get_or_create(&thread_key, session_directives.workspace.as_ref())
+            .get_or_create(&thread_key, session_directives.workspace.as_ref(), None)
             .await
         {
             let msg = format_user_error(&e.to_string());
@@ -567,6 +887,14 @@ impl AdapterRouter {
         let streaming = adapter.use_streaming(other_bot_present);
         let table_mode = self.table_mode;
         let tool_display = self.reactions_config.tool_display;
+        let attachments_config = self.attachments_config.clone();
+        let attachment_base_dir = match self.pool.working_dir_for_thread(thread_key).await {
+            Ok(dir) => PathBuf::from(dir),
+            Err(e) => {
+                warn!(thread_key, error = %e, "failed to resolve attachment base directory");
+                PathBuf::from("/tmp")
+            }
+        };
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
 
@@ -757,25 +1085,69 @@ impl AdapterRouter {
                     // before tool lines are composed into the display output.
                     let (directives, stripped_text) = parse_output_directives(&text_buf);
                     let text_buf = stripped_text;
+                    let (attachments, attachment_warnings) = prepare_output_attachments(
+                        &directives.attachments,
+                        &attachments_config,
+                        &attachment_base_dir,
+                    );
 
                     // Build final content
                     let final_content =
                         compose_display(&tool_lines, &text_buf, false, tool_display);
                     let final_content = if final_content.is_empty() {
-                        if let Some(err) = response_error {
+                        if let Some(err) = response_error.as_ref() {
                             format!("⚠️ {err}")
+                        } else if !attachments.is_empty() {
+                            "Attached requested file(s).".to_string()
+                        } else if !attachment_warnings.is_empty() {
+                            String::new()
                         } else {
                             "_(no response)_".to_string()
                         }
-                    } else if let Some(err) = response_error {
+                    } else if let Some(err) = response_error.as_ref() {
                         format!("⚠️ {err}\n\n{final_content}")
                     } else {
                         final_content
                     };
 
+                    let final_content = append_attachment_warnings(final_content, &attachment_warnings);
                     let final_content = markdown::convert_tables(&final_content, table_mode);
                     let chunks = format::split_message(&final_content, message_limit);
-                    if let Some(msg) = placeholder_msg {
+                    if !attachments.is_empty() {
+                        let first_chunk = chunks
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("Attached requested file(s).");
+                        match adapter
+                            .send_message_with_attachments(
+                                &thread_channel,
+                                first_chunk,
+                                &attachments,
+                                directives.reply_to.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                if let Some(msg) = placeholder_msg {
+                                    if let Err(e) = adapter.delete_message(&msg).await {
+                                        tracing::warn!(error = ?e, "delete placeholder failed; placeholder will remain visible");
+                                    }
+                                }
+                                for chunk in chunks.iter().skip(1) {
+                                    let _ = adapter.send_message(&thread_channel, chunk).await;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = ?e, "attachment send failed");
+                                let warning = format!("⚠️ attachment send failed: {e}");
+                                if let Some(msg) = placeholder_msg {
+                                    let _ = adapter.edit_message(&msg, &warning).await;
+                                } else {
+                                    let _ = adapter.send_message(&thread_channel, &warning).await;
+                                }
+                            }
+                        }
+                    } else if let Some(msg) = placeholder_msg {
                         if let Some(ref reply_id) = directives.reply_to {
                             // reply_to directive: send reply first, then delete placeholder.
                             // Only delete if send succeeds — preserves placeholder on failure.
@@ -1148,15 +1520,32 @@ mod tests {
 
 #[cfg(test)]
 mod directive_tests {
-    use crate::config::WorkspaceRequest;
+    use crate::config::{AgentAttachmentsConfig, WorkspaceRequest};
+    use std::fs;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
-    use super::{parse_output_directives, AdapterRouter};
+    use super::{
+        parse_output_directives, prepare_output_attachments, AdapterRouter, ChannelRef,
+        ChatAdapter, MessageRef, OutboundAttachment,
+    };
+
+    fn attachment_config(root: &Path) -> AgentAttachmentsConfig {
+        AgentAttachmentsConfig {
+            enabled: true,
+            allowed_paths: vec![root.to_string_lossy().to_string()],
+            max_files: 5,
+            max_file_bytes: 64,
+            max_total_bytes: 128,
+        }
+    }
 
     #[test]
     fn parse_reply_to_directive() {
         let input = "[[reply_to:1502606076451885136]]\nHello world";
         let (directives, content) = parse_output_directives(input);
         assert_eq!(directives.reply_to, Some("1502606076451885136".to_string()));
+        assert!(directives.attachments.is_empty());
         assert_eq!(content, "Hello world");
     }
 
@@ -1217,8 +1606,27 @@ mod directive_tests {
     }
 
     #[test]
-    fn parse_non_directive_line_stops_parsing() {
+    fn parse_late_reply_to_after_plain_text() {
         let input = "Normal first line\n[[reply_to:123]]\nMore content";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(directives.reply_to, Some("123".to_string()));
+        assert_eq!(content, "Normal first line\nMore content");
+    }
+
+    #[test]
+    fn parse_late_reply_to_inside_handoff_text() {
+        let input = "我会使用 handoff 技能。Automatic approval review approved.[[reply_to:1512261692329824328]] <@1511955018805280849> 请继承当前 workspace。";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(directives.reply_to, Some("1512261692329824328".to_string()));
+        assert_eq!(
+            content,
+            "我会使用 handoff 技能。Automatic approval review approved. <@1511955018805280849> 请继承当前 workspace。"
+        );
+    }
+
+    #[test]
+    fn parse_invalid_late_reply_to_is_preserved() {
+        let input = "Explain [[reply_to:has spaces]] syntax";
         let (directives, content) = parse_output_directives(input);
         assert_eq!(directives.reply_to, None);
         assert_eq!(content, input);
@@ -1301,6 +1709,307 @@ mod directive_tests {
         let (directives, content) = parse_output_directives(input);
         assert_eq!(directives.reply_to, Some("456".to_string()));
         assert_eq!(content, "看看 [[這個]] 怎麼樣");
+    }
+
+    #[test]
+    fn parse_attach_directive() {
+        let input = "[[attach:/workspace/out.log]]\nHere it is";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(directives.attachments, vec!["/workspace/out.log"]);
+        assert_eq!(content, "Here it is");
+    }
+
+    #[test]
+    fn parse_multiple_attach_directives() {
+        let input = "[[attach:a.log]]\n[[attach:b.png]]\nDone";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(directives.attachments, vec!["a.log", "b.png"]);
+        assert_eq!(content, "Done");
+    }
+
+    #[test]
+    fn parse_reply_to_and_attach_inline() {
+        let input = "[[reply_to:123]] [[attach:shot.png]] Screenshot attached";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(directives.reply_to, Some("123".to_string()));
+        assert_eq!(directives.attachments, vec!["shot.png"]);
+        assert_eq!(content, "Screenshot attached");
+    }
+
+    #[test]
+    fn late_attach_is_preserved_as_text() {
+        let input = "Explain [[attach:foo.log]] syntax";
+        let (directives, content) = parse_output_directives(input);
+        assert!(directives.attachments.is_empty());
+        assert_eq!(content, input);
+    }
+
+    #[test]
+    fn parse_late_attach_after_agent_preamble() {
+        let input = "Tool finished.[[attach:/workspace/out.log]]\nDone.";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(directives.attachments, vec!["/workspace/out.log"]);
+        assert_eq!(content, "Tool finished.\nDone.");
+    }
+
+    #[test]
+    fn parse_late_attach_only_at_line_boundary_after_close() {
+        let input = "Explain [[attach:/workspace/out.log]] syntax";
+        let (directives, content) = parse_output_directives(input);
+        assert!(directives.attachments.is_empty());
+        assert_eq!(content, input);
+    }
+
+    #[test]
+    fn prepare_attachment_resolves_relative_from_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("hello.log"), b"hello").unwrap();
+        let config = attachment_config(tmp.path());
+
+        let (attachments, warnings) =
+            prepare_output_attachments(&["hello.log".into()], &config, &project);
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "hello.log");
+        assert_eq!(attachments[0].bytes, b"hello");
+    }
+
+    #[test]
+    fn prepare_attachment_accepts_absolute_allowlisted_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("result.txt");
+        fs::write(&file, b"ok").unwrap();
+        let config = attachment_config(tmp.path());
+
+        let (attachments, warnings) =
+            prepare_output_attachments(&[file.to_string_lossy().to_string()], &config, tmp.path());
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "result.txt");
+    }
+
+    #[test]
+    fn prepare_attachment_rejects_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = attachment_config(tmp.path());
+
+        let (attachments, warnings) =
+            prepare_output_attachments(&["missing.log".into()], &config, tmp.path());
+
+        assert!(attachments.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("missing.log")));
+    }
+
+    #[test]
+    fn prepare_attachment_rejects_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dir");
+        fs::create_dir(&dir).unwrap();
+        let config = attachment_config(tmp.path());
+
+        let (attachments, warnings) =
+            prepare_output_attachments(&["dir".into()], &config, tmp.path());
+
+        assert!(attachments.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("not a regular file")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_attachment_rejects_unreadable_file() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("locked.log");
+        fs::write(&file, b"locked").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        let config = attachment_config(tmp.path());
+
+        let (attachments, warnings) =
+            prepare_output_attachments(&["locked.log".into()], &config, tmp.path());
+
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(attachments.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("cannot be read")));
+    }
+
+    #[test]
+    fn prepare_attachment_rejects_outside_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("outside.log");
+        fs::write(&outside_file, b"no").unwrap();
+        let config = attachment_config(tmp.path());
+
+        let (attachments, warnings) = prepare_output_attachments(
+            &[outside_file.to_string_lossy().to_string()],
+            &config,
+            tmp.path(),
+        );
+
+        assert!(attachments.is_empty());
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("outside the configured allowlist")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_attachment_rejects_symlink_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret.log");
+        fs::write(&outside_file, b"no").unwrap();
+        std::os::unix::fs::symlink(&outside_file, tmp.path().join("link.log")).unwrap();
+        let config = attachment_config(tmp.path());
+
+        let (attachments, warnings) =
+            prepare_output_attachments(&["link.log".into()], &config, tmp.path());
+
+        assert!(attachments.is_empty());
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("outside the configured allowlist")));
+    }
+
+    #[test]
+    fn prepare_attachment_rejects_too_many_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = attachment_config(tmp.path());
+        config.max_files = 1;
+
+        let (attachments, warnings) =
+            prepare_output_attachments(&["a.log".into(), "b.log".into()], &config, tmp.path());
+
+        assert!(attachments.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("too many files")));
+    }
+
+    #[test]
+    fn prepare_attachment_rejects_per_file_oversize() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("big.log"), vec![b'x'; 65]).unwrap();
+        let config = attachment_config(tmp.path());
+
+        let (attachments, warnings) =
+            prepare_output_attachments(&["big.log".into()], &config, tmp.path());
+
+        assert!(attachments.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("too large")));
+    }
+
+    #[test]
+    fn prepare_attachment_rejects_total_oversize() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.log"), vec![b'a'; 64]).unwrap();
+        fs::write(tmp.path().join("b.log"), vec![b'b'; 64]).unwrap();
+        fs::write(tmp.path().join("c.log"), vec![b'c'; 1]).unwrap();
+        let config = attachment_config(tmp.path());
+
+        let (attachments, warnings) = prepare_output_attachments(
+            &["a.log".into(), "b.log".into(), "c.log".into()],
+            &config,
+            tmp.path(),
+        );
+
+        assert!(attachments.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("total attachment size")));
+    }
+
+    #[test]
+    fn prepare_attachment_rejects_when_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.log"), b"a").unwrap();
+        let mut config = attachment_config(tmp.path());
+        config.enabled = false;
+
+        let (attachments, warnings) =
+            prepare_output_attachments(&["a.log".into()], &config, tmp.path());
+
+        assert!(attachments.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("disabled")));
+    }
+
+    #[derive(Default)]
+    struct FallbackAdapter {
+        sent: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatAdapter for FallbackAdapter {
+        fn platform(&self) -> &'static str {
+            "test"
+        }
+
+        fn message_limit(&self) -> usize {
+            2000
+        }
+
+        async fn send_message(
+            &self,
+            channel: &ChannelRef,
+            content: &str,
+        ) -> anyhow::Result<MessageRef> {
+            self.sent.lock().unwrap().push(content.to_string());
+            Ok(MessageRef {
+                channel: channel.clone(),
+                message_id: "1".into(),
+            })
+        }
+
+        async fn create_thread(
+            &self,
+            channel: &ChannelRef,
+            _trigger_msg: &MessageRef,
+            _title: &str,
+        ) -> anyhow::Result<ChannelRef> {
+            Ok(channel.clone())
+        }
+
+        async fn add_reaction(&self, _msg: &MessageRef, _emoji: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn remove_reaction(&self, _msg: &MessageRef, _emoji: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn use_streaming(&self, _other_bot_present: bool) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn non_discord_attachment_fallback_warns() {
+        let adapter = FallbackAdapter::default();
+        let channel = ChannelRef {
+            platform: "test".into(),
+            channel_id: "c".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+        let attachments = vec![OutboundAttachment {
+            filename: "a.log".into(),
+            bytes: b"a".to_vec(),
+        }];
+
+        adapter
+            .send_message_with_attachments(&channel, "body", &attachments, None)
+            .await
+            .unwrap();
+
+        let sent = adapter.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("body"));
+        assert!(sent[0].contains("attachment upload is not supported"));
     }
 
     #[test]

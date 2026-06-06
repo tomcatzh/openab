@@ -128,6 +128,47 @@ tests:
           path: data["config.toml"]
           pattern: 'max_bot_turns = 50'
 
+  - it: renders attachment upload disabled by default
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[discord.agent_attachments\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'enabled = false'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'allowed_paths = \[\]'
+
+  - it: renders attachment upload policy when enabled
+    set:
+      agents.kiro.discord.agentAttachments.enabled: true
+      agents.kiro.discord.agentAttachments.allowedPaths:
+        - /workspace
+        - /tmp
+      agents.kiro.discord.agentAttachments.maxFiles: 2
+      agents.kiro.discord.agentAttachments.maxFileBytes: 1024
+      agents.kiro.discord.agentAttachments.maxTotalBytes: 2048
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[discord.agent_attachments\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'enabled = true'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'allowed_paths = \["/workspace","/tmp"\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'max_files = 2'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'max_file_bytes = 1024'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'max_total_bytes = 2048'
+
   - it: does not render discord max_bot_turns when unset
     asserts:
       - notMatchRegex:

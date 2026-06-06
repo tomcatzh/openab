@@ -761,6 +761,9 @@ pub async fn run_slack_adapter(
                                                             AllowUsers::Mentions => {
                                                                 if !mentions_bot { continue; }
                                                             }
+                                                            AllowUsers::Primary => {
+                                                                if !mentions_bot { continue; }
+                                                            }
                                                             AllowUsers::Involved => {
                                                                 if !has_thread {
                                                                     continue;
@@ -1213,6 +1216,7 @@ async fn handle_message(
         sender_name: sender.sender_name.clone(),
         prompt,
         workspace_request: None,
+        thread_binding_context: None,
         extra_blocks,
         trigger_msg,
         arrived_at: std::time::Instant::now(),

@@ -76,6 +76,8 @@ pub struct Config {
     #[serde(default)]
     pub workspace: WorkspaceConfig,
     #[serde(default)]
+    pub thread_binding: ThreadBindingConfig,
+    #[serde(default)]
     pub reactions: ReactionsConfig,
     #[serde(default)]
     pub stt: SttConfig,
@@ -235,6 +237,10 @@ pub struct DiscordConfig {
     /// Batched mode only: soft token cap for greedy drain. Default: 24000.
     #[serde(default = "default_max_batch_tokens")]
     pub max_batch_tokens: usize,
+    /// Agent-originated outbound attachment upload policy.
+    /// Disabled by default; enabled deployments must also provide allowlisted paths.
+    #[serde(default)]
+    pub agent_attachments: AgentAttachmentsConfig,
 }
 
 fn default_max_bot_turns() -> u32 {
@@ -247,6 +253,40 @@ fn default_max_batch_tokens() -> usize {
     24_000
 }
 
+fn default_agent_attachment_max_files() -> usize {
+    5
+}
+
+fn default_agent_attachment_max_bytes() -> u64 {
+    25_165_824
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentAttachmentsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
+    #[serde(default = "default_agent_attachment_max_files")]
+    pub max_files: usize,
+    #[serde(default = "default_agent_attachment_max_bytes")]
+    pub max_file_bytes: u64,
+    #[serde(default = "default_agent_attachment_max_bytes")]
+    pub max_total_bytes: u64,
+}
+
+impl Default for AgentAttachmentsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_paths: Vec::new(),
+            max_files: default_agent_attachment_max_files(),
+            max_file_bytes: default_agent_attachment_max_bytes(),
+            max_total_bytes: default_agent_attachment_max_bytes(),
+        }
+    }
+}
+
 /// Controls whether the bot responds to user messages in threads without @mention.
 ///
 /// - `Involved` (default): respond to thread messages only if the bot has participated
@@ -255,12 +295,15 @@ fn default_max_batch_tokens() -> usize {
 /// - `Mentions`: always require @mention, even in threads the bot is participating in.
 /// - `MultibotMentions`: same as `Involved` in single-bot threads; falls back to `Mentions`
 ///   when other bots have also posted in the thread.
+/// - `Primary`: in bound threads, unmentioned user messages are processed only by the
+///   current ThreadBinding primary bot. Main-channel messages still require @mention.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AllowUsers {
     #[default]
     Involved,
     Mentions,
     MultibotMentions,
+    Primary,
 }
 
 impl<'de> Deserialize<'de> for AllowUsers {
@@ -270,9 +313,10 @@ impl<'de> Deserialize<'de> for AllowUsers {
             "involved" => Ok(Self::Involved),
             "mentions" => Ok(Self::Mentions),
             "multibot_mentions" => Ok(Self::MultibotMentions),
+            "primary" => Ok(Self::Primary),
             other => Err(serde::de::Error::unknown_variant(
                 other,
-                &["involved", "mentions", "multibot-mentions"],
+                &["involved", "mentions", "multibot-mentions", "primary"],
             )),
         }
     }
@@ -422,6 +466,44 @@ pub struct WorkspaceConfig {
     /// When true, the first message for a new session must include `[[ws:...]]`.
     #[serde(default)]
     pub required: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ThreadBindingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    #[serde(default)]
+    pub store_dir: Option<String>,
+    #[serde(default)]
+    pub channel_profiles: Vec<ChannelProfileConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChannelProfileConfig {
+    pub profile_id: String,
+    pub guild_id: String,
+    pub parent_channel_id: String,
+    pub work_domain: String,
+    pub workspace_root: String,
+    #[serde(default)]
+    pub allowed_agents: Vec<String>,
+    #[serde(default)]
+    pub agents: Vec<ChannelProfileAgentConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ChannelProfileAgentConfig {
+    pub name: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub discord_user_id: Option<String>,
+    #[serde(default)]
+    pub discord_role_id: Option<String>,
+    #[serde(default)]
+    pub handoff_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -973,6 +1055,42 @@ command = "echo"
             cfg.discord.unwrap().message_processing_mode,
             MessageProcessingMode::Message
         );
+    }
+
+    #[test]
+    fn agent_attachments_default_disabled() {
+        let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        let attachments = cfg.discord.unwrap().agent_attachments;
+        assert!(!attachments.enabled);
+        assert!(attachments.allowed_paths.is_empty());
+        assert_eq!(attachments.max_files, 5);
+        assert_eq!(attachments.max_file_bytes, 25_165_824);
+        assert_eq!(attachments.max_total_bytes, 25_165_824);
+    }
+
+    #[test]
+    fn agent_attachments_parse_explicit_policy() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[discord.agent_attachments]
+enabled = true
+allowed_paths = ["/workspace", "/tmp"]
+max_files = 2
+max_file_bytes = 1024
+max_total_bytes = 2048
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let attachments = cfg.discord.unwrap().agent_attachments;
+        assert!(attachments.enabled);
+        assert_eq!(attachments.allowed_paths, vec!["/workspace", "/tmp"]);
+        assert_eq!(attachments.max_files, 2);
+        assert_eq!(attachments.max_file_bytes, 1024);
+        assert_eq!(attachments.max_total_bytes, 2048);
     }
 
     #[test]

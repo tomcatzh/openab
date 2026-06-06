@@ -4,6 +4,33 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
+threadBinding:
+  # Workspace-file ThreadBinding store for small local multi-bot deployments.
+  # When enabled, each agent writes/reads /workspace/.openab/thread-bindings.json
+  # so bots in the same ChannelProfile can inherit the same project cwd.
+  enabled: false
+  storeDir: /workspace/.openab
+  channelProfiles: []
+  # Example:
+  # channelProfiles:
+  #   - profileId: software-dev
+  #     guildId: "123456789012345678"
+  #     parentChannelId: "234567890123456789"
+  #     workDomain: software-development
+  #     workspaceRoot: /workspace
+  #     allowedAgents: ["codex", "codex-reviewer"]
+  #     agents:
+  #       - name: codex
+  #         aliases: ["A", "dev"]
+  #         discordUserId: "345678901234567890"
+  #       - name: codex-reviewer
+  #         aliases: ["B", "reviewer"]
+  #         discordUserId: "456789012345678901"
+  #         discordRoleId: "567890123456789012"
+  #         handoffHint: "Mention this agent in Discord when a review handoff is requested."
+  # Use agents.<name>.discord.allowUserMessages="primary" to route unmentioned
+  # bound-thread user messages only to the ThreadBinding primary bot.
+
 # Chart-level name override used in generated resource names.
 # For per-agent overrides, use agents.<name>.nameOverride.
 nameOverride: ""
@@ -273,6 +300,12 @@ agents:
       # maxBufferedMessages: 10
       # maxBatchTokens: soft token cap per ACP turn for batching modes (default 24000)
       # maxBatchTokens: 24000
+      agentAttachments:
+        enabled: false
+        allowedPaths: []
+        maxFiles: 5
+        maxFileBytes: 25165824
+        maxTotalBytes: 25165824
     slack:
       enabled: false
       botToken: ""       # Bot User OAuth Token (xoxb-...)
@@ -292,7 +325,7 @@ agents:
       allowBotMessages: "off"
       # trustedBotIds: Bot User IDs (U...) — find via Slack UI: click bot profile → Copy member ID
       trustedBotIds: []
-      # allowUserMessages: "involved" (default) | "mentions" | "multibot-mentions"
+      # allowUserMessages: "involved" (default) | "mentions" | "multibot-mentions" | "primary"
       # "involved" = respond to thread follow-ups without @mention if bot has participated
       # "mentions" = always require @mention
       # "multibot-mentions" = same as "involved" in single-bot threads; require @mention

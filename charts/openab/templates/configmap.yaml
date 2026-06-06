@@ -57,10 +57,10 @@ data:
     {{- end }}
     {{- /* allowUserMessages: controls whether the bot requires @mention in threads (Discord) */ -}}
     {{- if $cfg.discord.allowUserMessages }}
-    {{- if not (has $cfg.discord.allowUserMessages (list "involved" "mentions" "multibot-mentions")) }}
-    {{- fail (printf "agents.%s.discord.allowUserMessages must be one of: involved, mentions, multibot-mentions (use hyphen form, not underscore) — got: %s" $name $cfg.discord.allowUserMessages) }}
+    {{- if not (has $cfg.discord.allowUserMessages (list "involved" "mentions" "multibot-mentions" "primary")) }}
+    {{- fail (printf "agents.%s.discord.allowUserMessages must be one of: involved, mentions, multibot-mentions, primary (use hyphen form, not underscore) — got: %s" $name $cfg.discord.allowUserMessages) }}
     {{- end }}
-    allow_user_messages = {{ $cfg.discord.allowUserMessages | toJson }}  {{- /* involved (default): respond in bot's threads without @mention | mentions: always require @mention | multibot-mentions: require @mention only when another bot has posted in the thread */ -}}
+    allow_user_messages = {{ $cfg.discord.allowUserMessages | toJson }}  {{- /* involved (default): respond in bot's threads without @mention | mentions: always require @mention | multibot-mentions: require @mention only when another bot has posted in the thread | primary: route unmentioned bound-thread user messages only to the ThreadBinding primary bot */ -}}
     {{- end }}
     {{- if hasKey $cfg.discord "allowDm" }}
     allow_dm = {{ $cfg.discord.allowDm }}
@@ -82,6 +82,13 @@ data:
     {{- if hasKey ($cfg.discord | default dict) "maxBatchTokens" }}
     max_batch_tokens = {{ ($cfg.discord).maxBatchTokens | int }}
     {{- end }}
+    {{- $agentAttachments := (($cfg.discord).agentAttachments | default dict) }}
+    [discord.agent_attachments]
+    enabled = {{ if hasKey $agentAttachments "enabled" }}{{ $agentAttachments.enabled }}{{ else }}false{{ end }}
+    allowed_paths = {{ ($agentAttachments.allowedPaths | default list) | toJson }}
+    max_files = {{ if hasKey $agentAttachments "maxFiles" }}{{ $agentAttachments.maxFiles | int }}{{ else }}5{{ end }}
+    max_file_bytes = {{ if hasKey $agentAttachments "maxFileBytes" }}{{ $agentAttachments.maxFileBytes | int }}{{ else }}25165824{{ end }}
+    max_total_bytes = {{ if hasKey $agentAttachments "maxTotalBytes" }}{{ $agentAttachments.maxTotalBytes | int }}{{ else }}25165824{{ end }}
     {{- end }}
 
     {{- if and ($cfg.slack).enabled }}
@@ -165,6 +172,45 @@ data:
     [workspace]
     root = "/workspace"
     required = {{ if hasKey $workspace "required" }}{{ $workspace.required }}{{ else }}false{{ end }}
+    {{- end }}
+    {{- $threadBinding := $.Values.threadBinding | default dict }}
+    {{- $threadBindingForAgent := false }}
+    {{- range $profile := ($threadBinding.channelProfiles | default list) }}
+    {{- if has $name ($profile.allowedAgents | default list) }}
+    {{- $threadBindingForAgent = true }}
+    {{- end }}
+    {{- end }}
+    {{- if and $threadBinding.enabled $threadBindingForAgent }}
+
+    [thread_binding]
+    enabled = true
+    agent_name = {{ $name | toJson }}
+    store_dir = {{ $threadBinding.storeDir | default "/workspace/.openab" | toJson }}
+    {{- range $profile := ($threadBinding.channelProfiles | default list) }}
+
+    [[thread_binding.channel_profiles]]
+    profile_id = {{ $profile.profileId | toJson }}
+    guild_id = {{ $profile.guildId | toJson }}
+    parent_channel_id = {{ $profile.parentChannelId | toJson }}
+    work_domain = {{ $profile.workDomain | toJson }}
+    workspace_root = {{ $profile.workspaceRoot | default "/workspace" | toJson }}
+    allowed_agents = {{ $profile.allowedAgents | default list | toJson }}
+    {{- range $agent := ($profile.agents | default list) }}
+
+    [[thread_binding.channel_profiles.agents]]
+    name = {{ $agent.name | toJson }}
+    aliases = {{ $agent.aliases | default list | toJson }}
+    {{- if $agent.discordUserId }}
+    discord_user_id = {{ $agent.discordUserId | toJson }}
+    {{- end }}
+    {{- if $agent.discordRoleId }}
+    discord_role_id = {{ $agent.discordRoleId | toJson }}
+    {{- end }}
+    {{- if $agent.handoffHint }}
+    handoff_hint = {{ $agent.handoffHint | toJson }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
     {{- end }}
 
     [reactions]

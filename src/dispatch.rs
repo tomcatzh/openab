@@ -22,6 +22,7 @@ use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef};
 use crate::config::{ReactionsConfig, WorkspaceRequest};
 use crate::error_display::format_user_error;
 use crate::reactions::StatusReactionController;
+use crate::thread_binding::ThreadBindingContext;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -40,6 +41,8 @@ pub struct BufferedMessage {
     /// Pre-parsed workspace directive from adapters that must validate before
     /// creating platform-specific resources such as Discord threads.
     pub workspace_request: Option<WorkspaceRequest>,
+    /// Shared workspace binding metadata for cross-bot cwd inheritance.
+    pub thread_binding_context: Option<ThreadBindingContext>,
     /// Attachment blocks (images, STT transcripts) in arrival order.
     pub extra_blocks: Vec<ContentBlock>,
     /// Anchor for reactions (👀 / ❌).
@@ -134,6 +137,7 @@ pub trait DispatchTarget: Send + Sync + 'static {
         &self,
         session_key: &str,
         workspace_request: Option<&WorkspaceRequest>,
+        binding_context: Option<&ThreadBindingContext>,
     ) -> Result<()>;
 
     /// Drive one ACP turn with the pre-packed `content_blocks`.
@@ -166,9 +170,10 @@ impl DispatchTarget for AdapterRouter {
         &self,
         session_key: &str,
         workspace_request: Option<&WorkspaceRequest>,
+        binding_context: Option<&ThreadBindingContext>,
     ) -> Result<()> {
         self.pool()
-            .get_or_create(session_key, workspace_request)
+            .get_or_create(session_key, workspace_request, binding_context)
             .await
     }
 
@@ -650,9 +655,11 @@ async fn dispatch_batch(
     let trigger_msg = batch.last().unwrap().trigger_msg.clone();
 
     let mut workspace_request: Option<WorkspaceRequest> = None;
+    let mut binding_context: Option<ThreadBindingContext> = None;
     let mut cleaned_batch = Vec::with_capacity(batch.len());
     for mut msg in batch {
         let adapter_workspace = msg.workspace_request.take();
+        let adapter_binding_context = msg.thread_binding_context.take();
         match AdapterRouter::parse_session_directives(&msg.prompt) {
             Ok((directives, cleaned_prompt)) => {
                 if directives.has_any() {
@@ -681,6 +688,9 @@ async fn dispatch_batch(
                         workspace_request = Some(adapter_workspace);
                     }
                 }
+                if binding_context.is_none() {
+                    binding_context = adapter_binding_context;
+                }
                 msg.prompt = cleaned_prompt;
                 cleaned_batch.push(msg);
             }
@@ -707,7 +717,11 @@ async fn dispatch_batch(
 
     // Ensure session exists.
     if let Err(e) = target
-        .ensure_session(&session_key, workspace_request.as_ref())
+        .ensure_session(
+            &session_key,
+            workspace_request.as_ref(),
+            binding_context.as_ref(),
+        )
         .await
     {
         let user_msg = format_user_error(&e.to_string());
@@ -1157,10 +1171,12 @@ mod tests {
             1,
             false,
             crate::config::WorkspaceConfig::default(),
+            crate::config::ThreadBindingConfig::default(),
         ));
         let router = Arc::new(AdapterRouter::new(
             pool,
             crate::config::ReactionsConfig::default(),
+            crate::config::AgentAttachmentsConfig::default(),
             crate::markdown::TableMode::Off,
             crate::config::default_prompt_hard_timeout_secs(),
             crate::config::default_liveness_check_secs(),
@@ -1370,6 +1386,7 @@ mod tests {
             &self,
             _session_key: &str,
             workspace_request: Option<&WorkspaceRequest>,
+            _binding_context: Option<&ThreadBindingContext>,
         ) -> Result<()> {
             self.ensure_workspaces
                 .lock()
@@ -1469,6 +1486,7 @@ mod tests {
             sender_name: "u".into(),
             prompt: prompt.into(),
             workspace_request: None,
+            thread_binding_context: None,
             extra_blocks: vec![],
             trigger_msg: MessageRef {
                 channel: make_channel("T"),

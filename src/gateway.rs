@@ -863,6 +863,7 @@ pub async fn run_gateway_adapter(
                                             sender_name,
                                             prompt,
                                             workspace_request: None,
+                                            thread_binding_context: None,
                                             extra_blocks,
                                             trigger_msg,
                                             arrived_at: std::time::Instant::now(),
