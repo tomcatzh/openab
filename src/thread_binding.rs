@@ -14,6 +14,11 @@ use tracing::{info, warn};
 const CHANNEL_PROFILES_FILE: &str = "channel-profiles.json";
 const THREAD_BINDINGS_FILE: &str = "thread-bindings.json";
 const THREAD_BINDINGS_LOCK: &str = "thread-bindings.lock";
+// A healthy holder keeps the lock only for one read-modify-write of a small
+// JSON file (well under a second). A lockfile older than this is presumed to
+// have been orphaned by a writer that died mid-update (e.g. an OOM kill on the
+// shared workspace PVC) and is reclaimed so writes do not wedge permanently.
+const LOCK_STALE_SECS: u64 = 30;
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -156,6 +161,7 @@ pub struct ThreadBindingStore {
     profiles: Vec<ChannelProfile>,
 }
 
+#[derive(Debug)]
 struct LockGuard {
     path: PathBuf,
 }
@@ -527,18 +533,49 @@ impl ThreadBindingStore {
     }
 
     fn acquire_lock(&self) -> Result<LockGuard> {
+        self.acquire_lock_with(Duration::from_secs(LOCK_STALE_SECS))
+    }
+
+    fn acquire_lock_with(&self, stale_after: Duration) -> Result<LockGuard> {
         fs::create_dir_all(&self.store_dir)?;
         let path = self.lock_path();
         for _ in 0..250 {
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(_) => return Ok(LockGuard { path }),
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    Self::try_reclaim_stale_lock(&path, stale_after);
                     thread::sleep(Duration::from_millis(20));
                 }
                 Err(e) => return Err(e.into()),
             }
         }
         Err(anyhow!("timed out acquiring thread binding lock"))
+    }
+
+    /// Reclaim a lockfile left behind by a writer that died mid-update. The
+    /// steal is done via an atomic rename: the rename source exists exactly
+    /// once, so two racing reclaimers can never both delete a lock — the loser
+    /// gets `NotFound` and simply retries `create_new`. A freshly created lock
+    /// can never be stolen because a live holder's lockfile is younger than
+    /// `stale_after`, and `create_new` keeps the source present until the
+    /// winner renames it away.
+    fn try_reclaim_stale_lock(path: &Path, stale_after: Duration) {
+        let Ok(modified) = fs::metadata(path).and_then(|m| m.modified()) else {
+            return;
+        };
+        let is_stale = SystemTime::now()
+            .duration_since(modified)
+            .map(|age| age >= stale_after)
+            .unwrap_or(false);
+        if !is_stale {
+            return;
+        }
+        let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let steal_path = path.with_extension(format!("steal.{}.{}", std::process::id(), counter));
+        if fs::rename(path, &steal_path).is_ok() {
+            let _ = fs::remove_file(&steal_path);
+            warn!(path = %path.display(), "reclaimed stale thread binding lock");
+        }
     }
 
     fn binding_key(platform: &str, thread_id: &str) -> String {
@@ -862,6 +899,50 @@ mod tests {
             .lookup_binding(&ctx("666666666666666666"))
             .expect("lookup b")
             .is_some());
+    }
+
+    #[test]
+    fn acquire_lock_reclaims_stale_lock() {
+        let tmp = TempDir::new().expect("tmp");
+        let root = tmp.path().join("workspace");
+        let store_dir = root.join(".openab");
+        fs::create_dir_all(&store_dir).expect("store dir");
+        let store = ThreadBindingStore::from_config(config(&root, &store_dir, "codex"), Some(""))
+            .expect("store");
+
+        // Simulate a lock left behind by a writer that crashed mid-update.
+        let lock_path = store.lock_path();
+        fs::write(&lock_path, b"").expect("seed stale lock");
+        assert!(lock_path.exists());
+
+        // A zero staleness window treats the orphaned lock as reclaimable, so
+        // the atomic-rename steal succeeds and acquisition proceeds instead of
+        // wedging until the 5s retry budget is exhausted.
+        let guard = store
+            .acquire_lock_with(Duration::from_secs(0))
+            .expect("reclaim stale lock");
+        drop(guard);
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn acquire_lock_keeps_fresh_lock_held_by_live_holder() {
+        let tmp = TempDir::new().expect("tmp");
+        let root = tmp.path().join("workspace");
+        let store_dir = root.join(".openab");
+        fs::create_dir_all(&store_dir).expect("store dir");
+        let store = ThreadBindingStore::from_config(config(&root, &store_dir, "codex"), Some(""))
+            .expect("store");
+
+        // A live holder's lock is younger than the staleness window and must
+        // not be stolen, so a second acquisition times out rather than racing
+        // in alongside the first guard.
+        let guard = store.acquire_lock().expect("first lock");
+        let err = store
+            .acquire_lock_with(Duration::from_secs(LOCK_STALE_SECS))
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+        drop(guard);
     }
 
     #[test]
