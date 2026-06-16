@@ -1340,8 +1340,25 @@ impl Handler {
     /// typing a path.
     async fn handle_ws_autocomplete(&self, ctx: &Context, ac: &CommandInteraction) {
         let query = ac.data.autocomplete().map(|o| o.value).unwrap_or("");
-        let names = self.router.pool().list_workspaces(query, 25);
+        let q = query.trim();
+        // Leave a slot for the synthetic "create new" entry so the total stays
+        // within Discord's 25-choice limit.
+        let names = self.router.pool().list_workspaces(query, 24);
+        let exact = names.iter().any(|n| n == q);
         let mut resp = CreateAutocompleteResponse::new();
+        // When the typed name is not an existing directory, surface an explicit
+        // "create new" entry at the top so users discover the create path
+        // instead of facing an empty list. The value fills `dir`; they still
+        // set `create: true` (which guards the auto wiki-init turn).
+        if !q.is_empty() && !exact {
+            let mut label = format!("➕ 新建：{q}（记得把 create 设为 True）");
+            if label.chars().count() > 100 {
+                label = format!("➕ 新建：{q}");
+            }
+            if label.chars().count() <= 100 {
+                resp = resp.add_string_choice(label, q);
+            }
+        }
         for name in names {
             resp = resp.add_string_choice(name.clone(), name);
         }
