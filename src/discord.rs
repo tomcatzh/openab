@@ -4,24 +4,24 @@ use crate::adapter::{
     AdapterRouter, ChannelRef, ChatAdapter, MessageRef, OutboundAttachment, SenderContext,
 };
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
-use crate::config::{AllowBots, AllowUsers, SttConfig};
+use crate::config::{AllowBots, AllowUsers, SttConfig, WorkspaceRequest};
 use crate::format;
 use crate::media;
 use crate::remind::{self, ReminderStore};
 use crate::thread_binding::{PrimaryUpdateActor, ThreadBindingContext};
 use async_trait::async_trait;
 use serenity::builder::{
-    CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
-    CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
-    CreateMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread,
-    EditMessage, GetMessages,
+    CreateActionRow, CreateAttachment, CreateAutocompleteResponse, CreateButton, CreateCommand,
+    CreateCommandOption, CreateInteractionResponse, CreateInteractionResponseFollowup,
+    CreateInteractionResponseMessage, CreateMessage, CreateSelectMenu, CreateSelectMenuKind,
+    CreateSelectMenuOption, CreateThread, EditMessage, GetMessages,
 };
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
 use serenity::model::application::{
-    Command, CommandOptionType, ComponentInteractionDataKind, Interaction,
+    Command, CommandInteraction, CommandOptionType, ComponentInteractionDataKind, Interaction,
 };
-use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
+use serenity::model::channel::{AutoArchiveDuration, ChannelType, Message, MessageType, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
@@ -835,6 +835,27 @@ impl Handler {
             return;
         }
 
+        // New tasks now start via the `/ws` slash command. The old
+        // `[[ws:...]]` / `[[title:...]]` message directives are retired: a new
+        // top-level (non-thread, non-DM) message no longer creates a thread.
+        // Existing threads and DMs keep dispatching normally below.
+        if !in_thread && !is_dm {
+            let ch = ChannelRef {
+                platform: "discord".into(),
+                channel_id: msg.channel_id.get().to_string(),
+                thread_id: None,
+                parent_id: thread_parent_id.clone(),
+                origin_event_id: None,
+            };
+            let _ = adapter
+                .send_message(
+                    &ch,
+                    "👉 用 `/ws` 命令开始一个新任务子区（输入框打 `/ws`，选目录、可勾选 create 新建并初始化 wiki、可填 title）。",
+                )
+                .await;
+            return;
+        }
+
         let (mut session_directives, prompt) =
             match AdapterRouter::parse_session_directives(&prompt) {
                 Ok(parsed) => parsed,
@@ -1152,6 +1173,27 @@ impl EventHandler for Handler {
 
         // Build the shared command list once.
         let commands = vec![
+            CreateCommand::new("ws")
+                .description("Start a new task thread bound to a workspace directory")
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "dir",
+                        "Workspace directory under /workspace (type to search, or a new name)",
+                    )
+                    .required(true)
+                    .set_autocomplete(true),
+                )
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::Boolean,
+                    "create",
+                    "Create the directory if missing and initialize an LLM wiki",
+                ))
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "title",
+                    "Thread title (optional; auto-named from the directory if omitted)",
+                )),
             CreateCommand::new("models").description("Select the AI model for this session"),
             CreateCommand::new("agents").description("Select the agent mode for this session"),
             CreateCommand::new("cancel").description("Cancel the current operation"),
@@ -1249,6 +1291,12 @@ impl EventHandler for Handler {
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
+            Interaction::Command(cmd) if cmd.data.name == "ws" => {
+                self.handle_ws_command(&ctx, &cmd).await;
+            }
+            Interaction::Autocomplete(ac) if ac.data.name == "ws" => {
+                self.handle_ws_autocomplete(&ctx, &ac).await;
+            }
             Interaction::Command(cmd) if cmd.data.name == "models" => {
                 self.handle_config_command(&ctx, &cmd, "model", "model")
                     .await;
@@ -1286,6 +1334,310 @@ impl EventHandler for Handler {
 // --- Slash command & interaction handlers ---
 
 impl Handler {
+    /// Autocomplete handler for `/ws dir:` — lists existing workspace
+    /// directories under the container workspace root, filtered by what the
+    /// user has typed so far. Lets mobile users pick a directory instead of
+    /// typing a path.
+    async fn handle_ws_autocomplete(&self, ctx: &Context, ac: &CommandInteraction) {
+        let query = ac.data.autocomplete().map(|o| o.value).unwrap_or("");
+        let names = self.router.pool().list_workspaces(query, 25);
+        let mut resp = CreateAutocompleteResponse::new();
+        for name in names {
+            resp = resp.add_string_choice(name.clone(), name);
+        }
+        if let Err(e) = ac
+            .create_response(&ctx.http, CreateInteractionResponse::Autocomplete(resp))
+            .await
+        {
+            tracing::debug!(error = %e, "failed to answer /ws autocomplete");
+        }
+    }
+
+    /// `/ws` slash command: start a new task thread bound to a workspace
+    /// directory. Replaces the old `[[ws:...]]` / `[[title:...]]` message
+    /// directives. Creates a public thread in the current channel, binds it to
+    /// the chosen workspace, and (for a freshly created directory) kicks off an
+    /// LLM-wiki bootstrap turn. After this the user just talks in the thread —
+    /// no @mention needed in a single-bot thread.
+    async fn handle_ws_command(&self, ctx: &Context, cmd: &CommandInteraction) {
+        let reply_ephemeral = |content: String| {
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(content)
+                    .ephemeral(true),
+            )
+        };
+
+        // --- Access control ---
+        if is_denied_user(
+            false,
+            self.allow_all_users,
+            &self.allowed_users,
+            cmd.user.id.get(),
+        ) {
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    reply_ephemeral("🚫 You are not allowed to use this bot.".to_string()),
+                )
+                .await;
+            return;
+        }
+
+        if !self.router.pool().workspace_enabled() {
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    reply_ephemeral(
+                        "⚠️ Workspace routing is not enabled on this deployment.".to_string(),
+                    ),
+                )
+                .await;
+            return;
+        }
+
+        // --- Channel must be an allowed top-level text channel (not a thread/DM) ---
+        let channel_id = cmd.channel_id;
+        let (in_allowed_channel, is_thread) = match channel_id.to_channel(&ctx.http).await {
+            Ok(serenity::model::channel::Channel::Guild(gc)) => (
+                self.allow_all_channels || self.allowed_channels.contains(&channel_id.get()),
+                gc.thread_metadata.is_some(),
+            ),
+            _ => (false, false),
+        };
+        if !in_allowed_channel {
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    reply_ephemeral("⚠️ Run `/ws` in an allowed channel.".to_string()),
+                )
+                .await;
+            return;
+        }
+        if is_thread {
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    reply_ephemeral(
+                        "⚠️ `/ws` starts a NEW thread — run it in the main channel, not inside a thread."
+                            .to_string(),
+                    ),
+                )
+                .await;
+            return;
+        }
+
+        // --- Read options ---
+        let dir = cmd
+            .data
+            .options
+            .iter()
+            .find(|o| o.name == "dir")
+            .and_then(|o| o.value.as_str())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let create = cmd
+            .data
+            .options
+            .iter()
+            .find(|o| o.name == "create")
+            .and_then(|o| o.value.as_bool())
+            .unwrap_or(false);
+        let title = cmd
+            .data
+            .options
+            .iter()
+            .find(|o| o.name == "title")
+            .and_then(|o| o.value.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        if dir.is_empty() {
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    reply_ephemeral("⚠️ Missing workspace directory.".to_string()),
+                )
+                .await;
+            return;
+        }
+
+        let request = if create {
+            WorkspaceRequest::Create(dir.clone())
+        } else {
+            WorkspaceRequest::Existing(dir.clone())
+        };
+
+        // --- Preflight before touching Discord, so a bad name leaves no orphan thread ---
+        if let Err(e) = self.router.pool().preflight_workspace_request(&request) {
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    reply_ephemeral(format!(
+                        "⚠️ {}",
+                        crate::error_display::format_user_error(&e.to_string())
+                    )),
+                )
+                .await;
+            return;
+        }
+
+        // Acknowledge now; thread creation + bind may take a couple HTTP calls.
+        if let Err(e) = cmd
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::Defer(
+                    CreateInteractionResponseMessage::new().ephemeral(true),
+                ),
+            )
+            .await
+        {
+            tracing::error!(error = %e, "failed to defer /ws response");
+            return;
+        }
+
+        let followup = |content: String| {
+            CreateInteractionResponseFollowup::new()
+                .content(content)
+                .ephemeral(true)
+        };
+
+        // --- Create the thread (standalone public thread, no trigger message) ---
+        let thread_name = thread_name_for_prompt(&dir, title.as_deref());
+        let thread = match channel_id
+            .create_thread(
+                &ctx.http,
+                CreateThread::new(&thread_name)
+                    .kind(ChannelType::PublicThread)
+                    .auto_archive_duration(AutoArchiveDuration::OneDay),
+            )
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to create thread for /ws");
+                let _ = cmd
+                    .create_followup(&ctx.http, followup(format!("⚠️ Failed to create thread: {e}")))
+                    .await;
+                return;
+            }
+        };
+        let thread_id = thread.id.get().to_string();
+        let parent_id = channel_id.get().to_string();
+
+        // --- Bind the workspace up front (creates the dir for `create`) ---
+        let binding_context = ThreadBindingContext {
+            platform: "discord".to_string(),
+            guild_id: cmd.guild_id.map(|g| g.get().to_string()),
+            parent_channel_id: Some(parent_id.clone()),
+            thread_id: thread_id.clone(),
+            created_by_user_id: Some(cmd.user.id.get().to_string()),
+            trigger_message_id: None,
+        };
+        let cwd = match self
+            .router
+            .pool()
+            .bind_thread_workspace(&thread_id, &request, Some(&binding_context))
+            .await
+        {
+            Ok(cwd) => cwd,
+            Err(e) => {
+                let user_msg = crate::error_display::format_user_error(&e.to_string());
+                let _ = thread
+                    .id
+                    .send_message(&ctx.http, CreateMessage::new().content(format!("⚠️ {user_msg}")))
+                    .await;
+                let _ = cmd
+                    .create_followup(&ctx.http, followup(format!("⚠️ {user_msg}")))
+                    .await;
+                return;
+            }
+        };
+
+        // --- Confirmation message in the thread (makes the bot "involved" so
+        //     plain follow-ups wake it in a single-bot thread) ---
+        let confirm = if request.creates_missing() {
+            format!("✅ 已创建并进入工作区 `{cwd}`\n正在初始化 LLM Wiki…")
+        } else {
+            format!(
+                "✅ 已进入工作区 `{cwd}`\n直接在这里发消息给我布置任务即可（单 bot 子区无需 @）。"
+            )
+        };
+        let confirm_msg = thread
+            .id
+            .send_message(&ctx.http, CreateMessage::new().content(confirm))
+            .await
+            .ok();
+
+        let _ = cmd
+            .create_followup(&ctx.http, followup(format!("→ <#{thread_id}>")))
+            .await;
+
+        // --- For a freshly created workspace, kick off an LLM-wiki bootstrap turn ---
+        if request.creates_missing() {
+            let Some(anchor) = confirm_msg else {
+                tracing::warn!("no confirmation message to anchor /ws bootstrap; skipping");
+                return;
+            };
+            let bootstrap_prompt = format!(
+                "这是一个全新的空工作区（cwd: {cwd}）。请使用 llm-wiki-bilingual skill 在当前目录\
+                 初始化一个 LLM Wiki 骨架（bootstrap：建立 wiki/ 目录、index 等基础结构）。\
+                 完成后用一两句话简要汇报你建立了什么。"
+            );
+            let bot_id = ctx.cache.current_user().id.get().to_string();
+            let display_name = cmd
+                .user
+                .global_name
+                .clone()
+                .unwrap_or_else(|| cmd.user.name.clone());
+            let sender = build_sender_context(
+                &cmd.user.id.to_string(),
+                &cmd.user.name,
+                &display_name,
+                &thread_id,
+                Some(&parent_id),
+                cmd.user.bot,
+                &chrono::Utc::now().to_rfc3339(),
+                &anchor.id.to_string(),
+                &bot_id,
+            );
+            let adapter = self
+                .adapter
+                .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
+                .clone();
+            let thread_channel = ChannelRef {
+                platform: "discord".into(),
+                channel_id: thread_id.clone(),
+                thread_id: None,
+                parent_id: Some(parent_id.clone()),
+                origin_event_id: None,
+            };
+            let dispatcher = self.dispatcher.clone();
+            let thread_key = dispatcher.key("discord", &thread_channel.channel_id, &sender.sender_id);
+            let sender_json = serde_json::to_string(&sender).unwrap();
+            let estimated_tokens = crate::dispatch::estimate_tokens(&bootstrap_prompt, &[]);
+            let buf_msg = crate::dispatch::BufferedMessage {
+                sender_json,
+                sender_name: sender.sender_name.clone(),
+                prompt: bootstrap_prompt,
+                // Already bound above; let resolve_working_dir read the map.
+                workspace_request: None,
+                thread_binding_context: Some(binding_context),
+                extra_blocks: Vec::new(),
+                trigger_msg: discord_msg_ref(&anchor),
+                arrived_at: std::time::Instant::now(),
+                estimated_tokens,
+                other_bot_present: false,
+            };
+            if let Err(e) = dispatcher
+                .submit(thread_key, thread_channel, adapter, buf_msg)
+                .await
+            {
+                tracing::error!(error = %e, "failed to submit /ws bootstrap turn");
+            }
+        }
+    }
+
     /// Build a Discord select menu from ACP configOptions with the given category.
     /// Paginates options in pages of 25 (Discord limit). The current selection is
     /// always placed first so it appears on page 0.

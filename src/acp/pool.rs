@@ -345,6 +345,120 @@ impl SessionPool {
         Ok(Some(WorkspaceRequest::Existing(workspace_name)))
     }
 
+    /// List immediate subdirectories of the workspace root for `/ws`
+    /// slash-command autocomplete. Skips hidden entries, filters by
+    /// case-insensitive substring, sorts (prefix matches first), and caps at
+    /// `limit` (Discord allows at most 25 autocomplete choices).
+    pub fn list_workspaces(&self, query: &str, limit: usize) -> Vec<String> {
+        let Some(root) = self.workspace_root() else {
+            return Vec::new();
+        };
+        let q = query.trim().to_lowercase();
+        let mut names: Vec<String> = match std::fs::read_dir(&root) {
+            Ok(entries) => entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| !n.starts_with('.'))
+                .filter(|n| q.is_empty() || n.to_lowercase().contains(&q))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        // Prefix matches first, then by name, so typing narrows intuitively.
+        names.sort_by(|a, b| {
+            let ap = a.to_lowercase().starts_with(&q);
+            let bp = b.to_lowercase().starts_with(&q);
+            bp.cmp(&ap).then_with(|| a.cmp(b))
+        });
+        names.truncate(limit);
+        names
+    }
+
+    /// Validate a workspace request WITHOUT creating anything. Used by `/ws`
+    /// before the Discord thread is created, so a bad name never leaves an
+    /// orphan thread behind. Mirrors `validate_requested_workspace` minus the
+    /// `create_dir_all` side effect.
+    pub fn preflight_workspace_request(&self, request: &WorkspaceRequest) -> Result<()> {
+        let Some(root) = self.workspace_root() else {
+            return Ok(());
+        };
+        let rel = Self::validate_workspace_name(request.name())?;
+        let requested = root.join(&rel);
+        if !requested.starts_with(&root) {
+            return Err(anyhow!("workspace is outside the workspace root"));
+        }
+        if requested.exists() {
+            if request.creates_missing() {
+                return Err(anyhow!(
+                    "workspace already exists: {}; pick it from the list instead of passing create",
+                    request.name()
+                ));
+            }
+            self.validate_existing_workspace_path(&requested, &root)?;
+            return Ok(());
+        }
+        if !request.creates_missing() {
+            return Err(anyhow!(
+                "workspace does not exist: {}; pass create: true to create it",
+                request.name()
+            ));
+        }
+        let root_canonical = std::fs::canonicalize(&root)
+            .map_err(|e| anyhow!("failed to resolve workspace root {}: {e}", root.display()))?;
+        let ancestor = Self::existing_ancestor(&requested)
+            .ok_or_else(|| anyhow!("workspace root does not exist: {}", root.display()))?;
+        let ancestor_canonical = std::fs::canonicalize(&ancestor).map_err(|e| {
+            anyhow!(
+                "failed to resolve workspace parent {}: {e}",
+                ancestor.display()
+            )
+        })?;
+        if !ancestor_canonical.starts_with(&root_canonical) {
+            return Err(anyhow!("workspace parent is outside the workspace root"));
+        }
+        Ok(())
+    }
+
+    /// Create/validate the requested workspace and bind it to a freshly-created
+    /// thread up front. `/ws` creates the Discord thread before any agent turn
+    /// runs, so the binding cannot wait for `resolve_working_dir`. Persists the
+    /// per-bot `thread_id -> cwd` map (the source of truth for single-bot
+    /// follow-ups) and best-effort records the shared ChannelProfile binding so
+    /// other bots can inherit the cwd. Returns the resolved absolute cwd.
+    pub async fn bind_thread_workspace(
+        &self,
+        thread_id: &str,
+        request: &WorkspaceRequest,
+        binding_context: Option<&ThreadBindingContext>,
+    ) -> Result<String> {
+        let cwd = self.validate_requested_workspace(request)?;
+        {
+            let mut state = self.state.write().await;
+            if let Some(existing) = state.workdirs.get(thread_id) {
+                let existing = existing.clone();
+                if existing == cwd {
+                    return Ok(cwd);
+                }
+                return Err(anyhow!(
+                    "thread already has workspace {existing}; start a new thread to change workspace"
+                ));
+            }
+            state.workdirs.insert(thread_id.to_string(), cwd.clone());
+            self.save_workdir_mapping(&state.workdirs);
+        }
+        if let (Some(store), Some(ctx)) = (&self.thread_binding_store, binding_context) {
+            if let Err(e) = store.record_binding(ctx, request.name(), &cwd) {
+                warn!(
+                    error = %e,
+                    "failed to record shared thread binding for /ws; \
+                     continuing with per-bot binding"
+                );
+            }
+        }
+        info!(thread_id, working_dir = %cwd, "bound thread workspace via /ws");
+        Ok(cwd)
+    }
+
     async fn resolve_working_dir(
         &self,
         thread_id: &str,
@@ -1119,6 +1233,154 @@ mod tests {
 
         let expected = project_dir.canonicalize().expect("canonical project dir");
         assert_eq!(cwd, expected.to_string_lossy());
+    }
+
+    #[test]
+    fn list_workspaces_filters_hidden_and_orders_prefix_first() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspaces");
+        let home_dir = tmp.path().join("home");
+        for d in ["openab-deploy", "openab-lab", "httpping", ".git", ".openab"] {
+            std::fs::create_dir_all(root.join(d)).expect("mkdir");
+        }
+        std::fs::write(root.join("a-file"), "x").expect("file"); // non-dir ignored
+        std::fs::create_dir_all(&home_dir).expect("home dir");
+
+        let pool = with_home(&home_dir, || {
+            SessionPool::new(
+                agent_config(tmp.path()),
+                1,
+                false,
+                workspace_config(&root, true),
+                thread_binding_config(),
+            )
+        });
+
+        // No query → all visible dirs, sorted, hidden + files excluded.
+        let all = pool.list_workspaces("", 25);
+        assert_eq!(all, vec!["httpping", "openab-deploy", "openab-lab"]);
+
+        // Query narrows; substring "lab" matches openab-lab.
+        assert_eq!(pool.list_workspaces("lab", 25), vec!["openab-lab"]);
+
+        // Prefix matches sort ahead of mid-string matches.
+        std::fs::create_dir_all(root.join("zz-openab")).expect("mkdir");
+        let q = pool.list_workspaces("openab", 25);
+        assert_eq!(q[0], "openab-deploy");
+        assert_eq!(q[1], "openab-lab");
+        assert!(q.contains(&"zz-openab".to_string()));
+        assert!(q.iter().position(|n| n == "zz-openab").unwrap() > 1);
+
+        // Limit is honored.
+        assert_eq!(pool.list_workspaces("", 1).len(), 1);
+    }
+
+    #[test]
+    fn preflight_workspace_request_validates_without_side_effects() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspaces");
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(root.join("project")).expect("project dir");
+        std::fs::create_dir_all(&home_dir).expect("home dir");
+
+        let pool = with_home(&home_dir, || {
+            SessionPool::new(
+                agent_config(tmp.path()),
+                1,
+                false,
+                workspace_config(&root, true),
+                thread_binding_config(),
+            )
+        });
+
+        // Existing without create → ok.
+        pool.preflight_workspace_request(&WorkspaceRequest::Existing("project".to_string()))
+            .expect("existing should pass");
+
+        // Missing without create → error, no directory created.
+        let err = pool
+            .preflight_workspace_request(&WorkspaceRequest::Existing("missing".to_string()))
+            .unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
+        assert!(!root.join("missing").exists());
+
+        // Missing with create → ok, still no side effect (preflight does not mkdir).
+        pool.preflight_workspace_request(&WorkspaceRequest::Create("fresh".to_string()))
+            .expect("create preflight should pass");
+        assert!(!root.join("fresh").exists());
+
+        // Existing with create → error (would clobber intent).
+        let err = pool
+            .preflight_workspace_request(&WorkspaceRequest::Create("project".to_string()))
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+
+        // Traversal rejected.
+        assert!(pool
+            .preflight_workspace_request(&WorkspaceRequest::Existing("../escape".to_string()))
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn bind_thread_workspace_creates_dir_and_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("workspaces");
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(&root).expect("workspace root");
+        std::fs::create_dir_all(&home_dir).expect("home dir");
+
+        let pool = with_home(&home_dir, || {
+            SessionPool::new(
+                agent_config(tmp.path()),
+                1,
+                false,
+                workspace_config(&root, true),
+                thread_binding_config(),
+            )
+        });
+
+        let thread_id = "discord:ws-thread";
+        let cwd = pool
+            .bind_thread_workspace(
+                thread_id,
+                &WorkspaceRequest::Create("fresh".to_string()),
+                None,
+            )
+            .await
+            .expect("bind should create and resolve");
+        let expected = root.join("fresh").canonicalize().expect("canonical");
+        assert_eq!(cwd, expected.to_string_lossy());
+        assert!(root.join("fresh").is_dir());
+
+        // A later turn with no directive resolves the same bound cwd.
+        let resolved = pool
+            .resolve_working_dir(thread_id, None, None)
+            .await
+            .expect("follow-up resolves persisted cwd");
+        assert_eq!(resolved, cwd);
+
+        // Re-binding the same workspace is idempotent.
+        let again = pool
+            .bind_thread_workspace(
+                thread_id,
+                &WorkspaceRequest::Existing("fresh".to_string()),
+                None,
+            )
+            .await
+            .expect("idempotent rebind");
+        assert_eq!(again, cwd);
+
+        // Binding a different workspace to the same thread is rejected.
+        std::fs::create_dir_all(root.join("other")).expect("other dir");
+        let err = pool
+            .bind_thread_workspace(
+                thread_id,
+                &WorkspaceRequest::Existing("other".to_string()),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already has workspace"));
     }
 
     #[tokio::test]
