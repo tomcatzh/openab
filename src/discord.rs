@@ -1265,7 +1265,7 @@ impl EventHandler for Handler {
                         CreateCommandOption::new(
                             CommandOptionType::String,
                             "goal",
-                            "What to accomplish — the bot drives the whole design→review→implement→review→approve loop autonomously",
+                            "What to accomplish — the bot drives the full self-verifying loop autonomously",
                         )
                         .required(true),
                     ),
