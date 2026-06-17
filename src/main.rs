@@ -461,6 +461,7 @@ async fn main() -> anyhow::Result<()> {
             allow_dm: discord_cfg.allow_dm,
             dispatcher: discord_dispatcher,
             register_goal_command: discord_cfg.register_goal_command,
+            register_ws_command: discord_cfg.register_ws_command,
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         };

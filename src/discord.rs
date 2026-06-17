@@ -258,6 +258,8 @@ pub struct Handler {
     pub dispatcher: Arc<crate::dispatch::Dispatcher>,
     /// Register the `/goal` slash command on this bot (coordinator bots only).
     pub register_goal_command: bool,
+    /// Register the `/ws` slash command on this bot (default true; false on admin).
+    pub register_ws_command: bool,
     /// Reminder store for /remind slash command.
     pub reminder_store: ReminderStore,
     /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
@@ -1175,27 +1177,6 @@ impl EventHandler for Handler {
 
         // Build the shared command list once.
         let commands = vec![
-            CreateCommand::new("ws")
-                .description("Start a new task thread bound to a workspace directory")
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "dir",
-                        "Workspace directory under /workspace (type to search, or a new name)",
-                    )
-                    .required(true)
-                    .set_autocomplete(true),
-                )
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::Boolean,
-                    "create",
-                    "Create the directory if missing and initialize an LLM wiki",
-                ))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "title",
-                    "Thread title (optional; auto-named from the directory if omitted)",
-                )),
             CreateCommand::new("models").description("Select the AI model for this session"),
             CreateCommand::new("agents").description("Select the agent mode for this session"),
             CreateCommand::new("cancel").description("Cancel the current operation"),
@@ -1252,9 +1233,38 @@ impl EventHandler for Handler {
                 )),
         ];
 
+        // `/ws` is opt-in per bot (default on). Disabled on bots that don't
+        // start task threads — e.g. the admin/operator bot — so it is never
+        // registered there (a durable, restart-proof removal, unlike an API delete).
+        let mut commands = commands;
+        if self.register_ws_command {
+            commands.push(
+                CreateCommand::new("ws")
+                    .description("Start a new task thread bound to a workspace directory")
+                    .add_option(
+                        CreateCommandOption::new(
+                            CommandOptionType::String,
+                            "dir",
+                            "Workspace directory under /workspace (type to search, or a new name)",
+                        )
+                        .required(true)
+                        .set_autocomplete(true),
+                    )
+                    .add_option(CreateCommandOption::new(
+                        CommandOptionType::Boolean,
+                        "create",
+                        "Create the directory if missing and initialize an LLM wiki",
+                    ))
+                    .add_option(CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "title",
+                        "Thread title (optional; auto-named from the directory if omitted)",
+                    )),
+            );
+        }
+
         // `/goal` is opt-in per bot (coordinator/primary bots only) so it only
         // appears in the slash picker where it belongs.
-        let mut commands = commands;
         if self.register_goal_command {
             commands.push(
                 CreateCommand::new("goal")

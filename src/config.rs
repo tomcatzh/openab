@@ -248,6 +248,11 @@ pub struct DiscordConfig {
     /// false so the command only appears where it belongs.
     #[serde(default)]
     pub register_goal_command: bool,
+    /// Register the `/ws` slash command (start a task thread) on this bot.
+    /// Default true. Set false on bots that never start task threads — e.g. the
+    /// admin/operator bot — so `/ws` is never registered there.
+    #[serde(default = "default_true")]
+    pub register_ws_command: bool,
 }
 
 fn default_max_bot_turns() -> u32 {
