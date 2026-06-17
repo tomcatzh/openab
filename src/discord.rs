@@ -256,6 +256,8 @@ pub struct Handler {
     pub allow_dm: bool,
     /// Per-thread dispatcher (Message mode uses cap=1 for FIFO; Thread/Lane use configured cap).
     pub dispatcher: Arc<crate::dispatch::Dispatcher>,
+    /// Register the `/goal` slash command on this bot (coordinator bots only).
+    pub register_goal_command: bool,
     /// Reminder store for /remind slash command.
     pub reminder_store: ReminderStore,
     /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
@@ -1250,6 +1252,26 @@ impl EventHandler for Handler {
                 )),
         ];
 
+        // `/goal` is opt-in per bot (coordinator/primary bots only) so it only
+        // appears in the slash picker where it belongs.
+        let mut commands = commands;
+        if self.register_goal_command {
+            commands.push(
+                CreateCommand::new("goal")
+                    .description(
+                        "Drive a full autonomous self-verifying loop for a goal (run inside a task thread)",
+                    )
+                    .add_option(
+                        CreateCommandOption::new(
+                            CommandOptionType::String,
+                            "goal",
+                            "What to accomplish — the bot drives the whole design→review→implement→review→approve loop autonomously",
+                        )
+                        .required(true),
+                    ),
+            );
+        }
+
         // Register global commands only. Registering the same commands per-guild
         // makes Discord show duplicate slash commands in guild command pickers.
         if let Err(e) = Command::set_global_commands(&ctx.http, commands.clone()).await {
@@ -1293,6 +1315,9 @@ impl EventHandler for Handler {
         match interaction {
             Interaction::Command(cmd) if cmd.data.name == "ws" => {
                 self.handle_ws_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "goal" => {
+                self.handle_goal_command(&ctx, &cmd).await;
             }
             Interaction::Autocomplete(ac) if ac.data.name == "ws" => {
                 self.handle_ws_autocomplete(&ctx, &ac).await;
@@ -1653,6 +1678,178 @@ impl Handler {
                 tracing::error!(error = %e, "failed to submit /ws bootstrap turn");
             }
         }
+    }
+
+    /// `/goal` slash command: run inside a `/ws`-created task thread, dispatch
+    /// one autonomous self-verifying-loop turn carrying the goal. The bot then
+    /// drives the whole design→review→implement→review→approve loop per its
+    /// profile (mention, not handover) — the user gives only the goal.
+    async fn handle_goal_command(&self, ctx: &Context, cmd: &CommandInteraction) {
+        let reply_ephemeral = |content: String| {
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(content)
+                    .ephemeral(true),
+            )
+        };
+
+        if is_denied_user(
+            false,
+            self.allow_all_users,
+            &self.allowed_users,
+            cmd.user.id.get(),
+        ) {
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    reply_ephemeral("🚫 You are not allowed to use this bot.".to_string()),
+                )
+                .await;
+            return;
+        }
+
+        // Must run inside an allowed thread (a /ws-created task thread).
+        let channel_id = cmd.channel_id;
+        let (in_allowed_thread, parent_id) = match channel_id.to_channel(&ctx.http).await {
+            Ok(serenity::model::channel::Channel::Guild(gc)) => {
+                let parent = gc.parent_id.map(|id| id.get().to_string());
+                let in_allowed = self.allow_all_channels
+                    || self.allowed_channels.contains(&channel_id.get())
+                    || gc
+                        .parent_id
+                        .map(|p| self.allowed_channels.contains(&p.get()))
+                        .unwrap_or(false);
+                (gc.thread_metadata.is_some() && in_allowed, parent)
+            }
+            _ => (false, None),
+        };
+        if !in_allowed_thread {
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    reply_ephemeral(
+                        "⚠️ Run `/goal` inside a task thread — start one with `/ws` first, then `/goal` in that thread."
+                            .to_string(),
+                    ),
+                )
+                .await;
+            return;
+        }
+
+        let goal = cmd
+            .data
+            .options
+            .iter()
+            .find(|o| o.name == "goal")
+            .and_then(|o| o.value.as_str())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if goal.is_empty() {
+            let _ = cmd
+                .create_response(&ctx.http, reply_ephemeral("⚠️ Empty goal.".to_string()))
+                .await;
+            return;
+        }
+
+        if let Err(e) = cmd
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::Defer(
+                    CreateInteractionResponseMessage::new().ephemeral(true),
+                ),
+            )
+            .await
+        {
+            tracing::error!(error = %e, "failed to defer /goal response");
+            return;
+        }
+
+        let prompt = build_goal_prompt(&goal);
+        let thread_id = channel_id.get().to_string();
+
+        // Visible marker in the thread: shows the goal and anchors reactions.
+        let marker = channel_id
+            .send_message(
+                &ctx.http,
+                CreateMessage::new().content(format!("🎯 **GOAL**: {goal}\n_自动循环开始…_")),
+            )
+            .await
+            .ok();
+
+        let bot_id = ctx.cache.current_user().id.get().to_string();
+        let display_name = cmd
+            .user
+            .global_name
+            .clone()
+            .unwrap_or_else(|| cmd.user.name.clone());
+        let sender = build_sender_context(
+            &cmd.user.id.to_string(),
+            &cmd.user.name,
+            &display_name,
+            &thread_id,
+            parent_id.as_deref(),
+            cmd.user.bot,
+            &chrono::Utc::now().to_rfc3339(),
+            &marker
+                .as_ref()
+                .map(|m| m.id.to_string())
+                .unwrap_or_default(),
+            &bot_id,
+        );
+
+        let adapter = self
+            .adapter
+            .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
+            .clone();
+        let thread_channel = ChannelRef {
+            platform: "discord".into(),
+            channel_id: thread_id.clone(),
+            thread_id: None,
+            parent_id: parent_id.clone(),
+            origin_event_id: None,
+        };
+        let binding_context = parent_id.as_ref().map(|p| ThreadBindingContext {
+            platform: "discord".to_string(),
+            guild_id: cmd.guild_id.map(|g| g.get().to_string()),
+            parent_channel_id: Some(p.clone()),
+            thread_id: thread_id.clone(),
+            created_by_user_id: Some(cmd.user.id.get().to_string()),
+            trigger_message_id: None,
+        });
+        let dispatcher = self.dispatcher.clone();
+        let thread_key = dispatcher.key("discord", &thread_channel.channel_id, &sender.sender_id);
+        let sender_json = serde_json::to_string(&sender).unwrap();
+        let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &[]);
+        let trigger_msg = marker.as_ref().map(discord_msg_ref).unwrap_or_else(|| MessageRef {
+            channel: thread_channel.clone(),
+            message_id: thread_id.clone(),
+        });
+        let buf_msg = crate::dispatch::BufferedMessage {
+            sender_json,
+            sender_name: sender.sender_name.clone(),
+            prompt,
+            workspace_request: None,
+            thread_binding_context: binding_context,
+            extra_blocks: Vec::new(),
+            trigger_msg,
+            arrived_at: std::time::Instant::now(),
+            estimated_tokens,
+            other_bot_present: false,
+        };
+        if let Err(e) = dispatcher
+            .submit(thread_key, thread_channel, adapter, buf_msg)
+            .await
+        {
+            tracing::error!(error = %e, "failed to submit /goal turn");
+        }
+        let _ = cmd
+            .create_followup(
+                &ctx.http,
+                CreateInteractionResponseFollowup::new()
+                    .content("🎯 目标已下发,开始自动循环。")
+                    .ephemeral(true),
+            )
+            .await;
     }
 
     /// Build a Discord select menu from ACP configOptions with the given category.
@@ -2700,6 +2897,22 @@ async fn get_or_create_thread(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Expand a `/goal` into the autonomous self-verifying-loop directive dispatched
+/// to the coordinator bot. The per-role loop specifics (who reviews, the exit
+/// condition) come from the bot's own profile; this supplies the goal plus the
+/// "drive it autonomously, mention-not-handover, git throughout" contract.
+/// Must contain no `[[...]]` directive tokens (they would trip the dispatch guard).
+fn build_goal_prompt(goal: &str) -> String {
+    format!(
+        "🎯 GOAL: {goal}\n\n\
+         把这个目标当作一条全自动自校验循环驱动到完成 —— 步骤之间不要停下来等我。\
+         严格按你角色的协作协议执行:设计 → 用 mention 请 peer 评审并达成共识 → 实现 → \
+         peer 评审 → 修订,循环到你角色的退出条件满足(所有评审明确批准 / \"good to print\")。\
+         每一次 bot 之间的往返都用 mention(评审往返绝不用 handover),全程 git 提交。\
+         只在退出条件真正满足时才向我汇报最终结果。保留项目,不要删除。"
+    )
 }
 
 fn thread_name_for_prompt(prompt: &str, explicit_title: Option<&str>) -> String {

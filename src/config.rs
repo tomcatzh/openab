@@ -241,6 +241,13 @@ pub struct DiscordConfig {
     /// Disabled by default; enabled deployments must also provide allowlisted paths.
     #[serde(default)]
     pub agent_attachments: AgentAttachmentsConfig,
+    /// Register the `/goal` slash command on this bot. Intended for
+    /// coordinator/primary bots (e.g. the architect / designer that drives a
+    /// multi-bot self-verifying loop). `/goal <text>`, run inside a bound
+    /// thread, dispatches one autonomous-loop turn carrying the goal. Default
+    /// false so the command only appears where it belongs.
+    #[serde(default)]
+    pub register_goal_command: bool,
 }
 
 fn default_max_bot_turns() -> u32 {
