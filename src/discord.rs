@@ -1412,12 +1412,24 @@ impl Handler {
     /// LLM-wiki bootstrap turn. After this the user just talks in the thread —
     /// no @mention needed in a single-bot thread.
     async fn handle_ws_command(&self, ctx: &Context, cmd: &CommandInteraction) {
-        let reply_ephemeral = |content: String| {
-            CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content(content)
-                    .ephemeral(true),
+        // Defer IMMEDIATELY (before to_channel) so the 3s interaction ack is
+        // never missed when the bot is busy. All validation below uses followups.
+        if let Err(e) = cmd
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::Defer(
+                    CreateInteractionResponseMessage::new().ephemeral(true),
+                ),
             )
+            .await
+        {
+            tracing::error!(error = %e, "failed to defer /ws response");
+            return;
+        }
+        let deny = |content: String| {
+            CreateInteractionResponseFollowup::new()
+                .content(content)
+                .ephemeral(true)
         };
 
         // --- Access control ---
@@ -1428,21 +1440,16 @@ impl Handler {
             cmd.user.id.get(),
         ) {
             let _ = cmd
-                .create_response(
-                    &ctx.http,
-                    reply_ephemeral("🚫 You are not allowed to use this bot.".to_string()),
-                )
+                .create_followup(&ctx.http, deny("🚫 You are not allowed to use this bot.".to_string()))
                 .await;
             return;
         }
 
         if !self.router.pool().workspace_enabled() {
             let _ = cmd
-                .create_response(
+                .create_followup(
                     &ctx.http,
-                    reply_ephemeral(
-                        "⚠️ Workspace routing is not enabled on this deployment.".to_string(),
-                    ),
+                    deny("⚠️ Workspace routing is not enabled on this deployment.".to_string()),
                 )
                 .await;
             return;
@@ -1459,34 +1466,29 @@ impl Handler {
         };
         if !in_allowed_channel {
             let _ = cmd
-                .create_response(
-                    &ctx.http,
-                    reply_ephemeral("⚠️ Run `/ws` in an allowed channel.".to_string()),
-                )
+                .create_followup(&ctx.http, deny("⚠️ Run `/ws` in an allowed channel.".to_string()))
                 .await;
             return;
         }
         if is_thread {
             let _ = cmd
-                .create_response(
+                .create_followup(
                     &ctx.http,
-                    reply_ephemeral(
-                        "⚠️ `/ws` starts a NEW thread — run it in the main channel, not inside a thread."
-                            .to_string(),
-                    ),
+                    deny("⚠️ `/ws` starts a NEW thread — run it in the main channel, not inside a thread.".to_string()),
                 )
                 .await;
             return;
         }
 
-        // --- Read options ---
+        // --- Read options --- (sanitize dir: Discord can submit the "➕ 新建" entry's
+        // display label as the value, so recover the clean directory name.)
         let dir = cmd
             .data
             .options
             .iter()
             .find(|o| o.name == "dir")
             .and_then(|o| o.value.as_str())
-            .map(|s| s.trim().to_string())
+            .map(sanitize_ws_dir)
             .unwrap_or_default();
         let create = cmd
             .data
@@ -1506,10 +1508,7 @@ impl Handler {
 
         if dir.is_empty() {
             let _ = cmd
-                .create_response(
-                    &ctx.http,
-                    reply_ephemeral("⚠️ Missing workspace directory.".to_string()),
-                )
+                .create_followup(&ctx.http, deny("⚠️ Missing workspace directory.".to_string()))
                 .await;
             return;
         }
@@ -1523,9 +1522,9 @@ impl Handler {
         // --- Preflight before touching Discord, so a bad name leaves no orphan thread ---
         if let Err(e) = self.router.pool().preflight_workspace_request(&request) {
             let _ = cmd
-                .create_response(
+                .create_followup(
                     &ctx.http,
-                    reply_ephemeral(format!(
+                    deny(format!(
                         "⚠️ {}",
                         crate::error_display::format_user_error(&e.to_string())
                     )),
@@ -1534,25 +1533,8 @@ impl Handler {
             return;
         }
 
-        // Acknowledge now; thread creation + bind may take a couple HTTP calls.
-        if let Err(e) = cmd
-            .create_response(
-                &ctx.http,
-                CreateInteractionResponse::Defer(
-                    CreateInteractionResponseMessage::new().ephemeral(true),
-                ),
-            )
-            .await
-        {
-            tracing::error!(error = %e, "failed to defer /ws response");
-            return;
-        }
-
-        let followup = |content: String| {
-            CreateInteractionResponseFollowup::new()
-                .content(content)
-                .ephemeral(true)
-        };
+        // (already deferred at the top of the handler — no second defer here.)
+        let followup = deny;
 
         // --- Create the thread (standalone public thread, no trigger message) ---
         let thread_name = thread_name_for_prompt(&dir, title.as_deref());
@@ -1695,12 +1677,27 @@ impl Handler {
     /// drives the whole design→review→implement→review→approve loop per its
     /// profile (mention, not handover) — the user gives only the goal.
     async fn handle_goal_command(&self, ctx: &Context, cmd: &CommandInteraction) {
-        let reply_ephemeral = |content: String| {
-            CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content(content)
-                    .ephemeral(true),
+        // Defer IMMEDIATELY — before any REST call (to_channel) or other await —
+        // so Discord's 3-second interaction ack is never missed even when the bot
+        // is busy and to_channel is slow. (Deferring late caused "Unknown
+        // interaction" / "应用程序未响应".) All validation below replies via
+        // ephemeral followups.
+        if let Err(e) = cmd
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::Defer(
+                    CreateInteractionResponseMessage::new().ephemeral(true),
+                ),
             )
+            .await
+        {
+            tracing::error!(error = %e, "failed to defer /goal response");
+            return;
+        }
+        let deny = |content: String| {
+            CreateInteractionResponseFollowup::new()
+                .content(content)
+                .ephemeral(true)
         };
 
         if is_denied_user(
@@ -1710,10 +1707,7 @@ impl Handler {
             cmd.user.id.get(),
         ) {
             let _ = cmd
-                .create_response(
-                    &ctx.http,
-                    reply_ephemeral("🚫 You are not allowed to use this bot.".to_string()),
-                )
+                .create_followup(&ctx.http, deny("🚫 You are not allowed to use this bot.".to_string()))
                 .await;
             return;
         }
@@ -1735,12 +1729,9 @@ impl Handler {
         };
         if !in_allowed_thread {
             let _ = cmd
-                .create_response(
+                .create_followup(
                     &ctx.http,
-                    reply_ephemeral(
-                        "⚠️ Run `/goal` inside a task thread — start one with `/ws` first, then `/goal` in that thread."
-                            .to_string(),
-                    ),
+                    deny("⚠️ Run `/goal` inside a task thread — start one with `/ws` first, then `/goal` in that thread.".to_string()),
                 )
                 .await;
             return;
@@ -1756,21 +1747,8 @@ impl Handler {
             .unwrap_or_default();
         if goal.is_empty() {
             let _ = cmd
-                .create_response(&ctx.http, reply_ephemeral("⚠️ Empty goal.".to_string()))
+                .create_followup(&ctx.http, deny("⚠️ Empty goal.".to_string()))
                 .await;
-            return;
-        }
-
-        if let Err(e) = cmd
-            .create_response(
-                &ctx.http,
-                CreateInteractionResponse::Defer(
-                    CreateInteractionResponseMessage::new().ephemeral(true),
-                ),
-            )
-            .await
-        {
-            tracing::error!(error = %e, "failed to defer /goal response");
             return;
         }
 
@@ -2923,6 +2901,24 @@ fn build_goal_prompt(goal: &str) -> String {
          每一次 bot 之间的往返都用 mention(评审往返绝不用 handover),全程 git 提交。\
          只在退出条件真正满足时才向我汇报最终结果。保留项目,不要删除。"
     )
+}
+
+/// Recover a clean workspace directory name from the `/ws dir` option value.
+/// Discord can submit the "➕ 新建：<name>（…）" autocomplete entry's DISPLAY label
+/// as the value (a client quirk when the create-entry is clicked), so strip that
+/// prefix and any trailing parenthetical note. Plain values pass through unchanged.
+fn sanitize_ws_dir(s: &str) -> String {
+    let mut d = s.trim();
+    for prefix in ["➕ 新建：", "➕ 新建:", "新建："] {
+        if let Some(rest) = d.strip_prefix(prefix) {
+            d = rest.trim();
+            break;
+        }
+    }
+    if let Some(i) = d.find(['（', '(']) {
+        d = d[..i].trim();
+    }
+    d.to_string()
 }
 
 fn thread_name_for_prompt(prompt: &str, explicit_title: Option<&str>) -> String {
