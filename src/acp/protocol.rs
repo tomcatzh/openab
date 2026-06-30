@@ -200,6 +200,59 @@ pub fn parse_config_options(result: &Value) -> Vec<ConfigOption> {
     options
 }
 
+// --- ACP prompt result parsing (bd16546) ---
+
+/// Parsed fields from the `session/prompt` final response `result` object.
+/// All fields are optional — agents may omit `usage` entirely. `input_tokens`
+/// and `total_tokens` are parsed for fidelity with upstream's `TurnResult`
+/// (eases future convergence / telemetry) even though only `stop_reason` and
+/// `output_tokens` drive `is_silent_failure` today.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub struct TurnResult {
+    pub stop_reason: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+impl TurnResult {
+    /// True when the turn ended normally (`stopReason == "end_turn"`) but
+    /// produced zero output tokens — a strong signal of a silent provider/auth
+    /// failure. Absent `usage` (output_tokens == None) is NOT a silent failure,
+    /// so this never fires on agents that simply omit usage.
+    pub fn is_silent_failure(&self) -> bool {
+        matches!(
+            (self.stop_reason.as_deref(), self.output_tokens),
+            (Some("end_turn"), Some(0))
+        )
+    }
+}
+
+/// Parse `stopReason` and `usage` from a `session/prompt` result value.
+pub fn parse_turn_result(result: &Value) -> TurnResult {
+    let stop_reason = result
+        .get("stopReason")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let usage = result.get("usage");
+    let input_tokens = usage
+        .and_then(|u| u.get("inputTokens"))
+        .and_then(|v| v.as_u64());
+    let output_tokens = usage
+        .and_then(|u| u.get("outputTokens"))
+        .and_then(|v| v.as_u64());
+    let total_tokens = usage
+        .and_then(|u| u.get("totalTokens"))
+        .and_then(|v| v.as_u64());
+    TurnResult {
+        stop_reason,
+        input_tokens,
+        output_tokens,
+        total_tokens,
+    }
+}
+
 // --- ACP notification classification ---
 
 #[derive(Debug)]
@@ -402,5 +455,44 @@ mod tests {
         let opts = parse_config_options(&result);
         assert_eq!(opts.len(), 1);
         assert_eq!(opts[0].id, "model");
+    }
+
+    // --- (bd16546) turn-result parsing + silent-failure detection ---
+
+    #[test]
+    fn parse_turn_result_full() {
+        let result = json!({
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 120, "outputTokens": 45, "totalTokens": 165}
+        });
+        let tr = parse_turn_result(&result);
+        assert_eq!(tr.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(tr.output_tokens, Some(45));
+        assert_eq!(tr.total_tokens, Some(165));
+        assert!(!tr.is_silent_failure());
+    }
+
+    #[test]
+    fn parse_turn_result_silent_failure() {
+        let result = json!({
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 80, "outputTokens": 0}
+        });
+        assert!(parse_turn_result(&result).is_silent_failure());
+    }
+
+    #[test]
+    fn parse_turn_result_missing_usage_is_not_silent_failure() {
+        // No usage block at all → output_tokens None → NOT a silent failure.
+        let tr = parse_turn_result(&json!({"stopReason": "end_turn"}));
+        assert_eq!(tr.output_tokens, None);
+        assert!(!tr.is_silent_failure());
+    }
+
+    #[test]
+    fn parse_turn_result_other_stop_reason_not_silent() {
+        // Zero output but a non-end_turn stop reason (e.g. cancelled) is not flagged.
+        let result = json!({"stopReason": "cancelled", "usage": {"outputTokens": 0}});
+        assert!(!parse_turn_result(&result).is_silent_failure());
     }
 }

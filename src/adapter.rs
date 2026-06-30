@@ -8,7 +8,7 @@ use std::{
 };
 use tracing::{error, warn};
 
-use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
+use crate::acp::{classify_notification, parse_turn_result, AcpEvent, ContentBlock, SessionPool};
 use crate::config::{AgentAttachmentsConfig, ReactionsConfig, ToolDisplay, WorkspaceRequest};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
@@ -967,8 +967,23 @@ impl AdapterRouter {
                         let notification = tokio::select! {
                             msg = rx.recv() => match msg {
                                 Some(n) => n,
-                                // Reader saw EOF and already drained pending; nothing to abandon.
-                                None => break,
+                                // (#1198) Reader saw EOF: the agent's stdout closed. A
+                                // successful turn is always signalled by the id-bearing
+                                // response to session/prompt, which breaks the loop at the id
+                                // branch below *before* any EOF — so reaching this arm means
+                                // the turn ended without a final response, i.e. the agent
+                                // terminated abnormally (a bridged agent that crashes on a
+                                // backend error such as HTTP 500 / quota exhaustion exits
+                                // without ever emitting an ACP error notification). Surface it
+                                // explicitly instead of silently falling through to
+                                // "_(no response)_" or presenting a partial buffer as complete.
+                                None => {
+                                    if response_error.is_none() {
+                                        response_error =
+                                            Some("Agent process exited unexpectedly".into());
+                                    }
+                                    break;
+                                }
                             },
                             _ = tokio::time::sleep(liveness_check_interval) => {
                                 if !conn.alive() {
@@ -998,6 +1013,20 @@ impl AdapterRouter {
                             }
                             if let Some(ref err) = notification.error {
                                 response_error = Some(format_coded_error(err.code, &err.message, err.data_message()));
+                            } else if let Some(ref result) = notification.result {
+                                // (bd16546) A successful turn that ends with
+                                // stopReason="end_turn" but zero output tokens is a strong
+                                // signal of a silent provider/auth failure (e.g. the backend
+                                // accepted the prompt, returned an empty completion, and the
+                                // bridge reported a clean end_turn). Surface a diagnostic
+                                // instead of falling through to "_(no response)_".
+                                if parse_turn_result(result).is_silent_failure() {
+                                    response_error = Some(
+                                        "Agent ended the turn with no output (0 output tokens) \
+                                         — likely a silent provider or auth failure"
+                                            .into(),
+                                    );
+                                }
                             }
                             break;
                         }
@@ -1112,7 +1141,25 @@ impl AdapterRouter {
 
                     let final_content = append_attachment_warnings(final_content, &attachment_warnings);
                     let final_content = markdown::convert_tables(&final_content, table_mode);
-                    let chunks = format::split_message(&final_content, message_limit);
+                    // (#1153) On Discord a reply that exceeds the 2000-char limit is split
+                    // into multiple messages, but only the chunk carrying the original
+                    // @mention passes a receiving bot's mention gate (allowBotMessages
+                    // = "mentions" / trustedBotIds-only-when-mentioned). Subsequent chunks
+                    // are rejected and their content is silently lost. Propagate every
+                    // mention to all chunks so the whole handoff lands in one ACP turn.
+                    // Pre-deduct the mention footer from the split limit so an appended
+                    // footer never busts the hard message-length ceiling.
+                    let chunks = if adapter.platform() == "discord" {
+                        let mentions = extract_mentions(&final_content);
+                        let mention_reserve = mention_footer_len(&mentions);
+                        let chunks = format::split_message(
+                            &final_content,
+                            message_limit.saturating_sub(mention_reserve),
+                        );
+                        propagate_mentions_to_chunks(chunks, &mentions, message_limit)
+                    } else {
+                        format::split_message(&final_content, message_limit)
+                    };
                     if !attachments.is_empty() {
                         let first_chunk = chunks
                             .first()
@@ -1175,6 +1222,30 @@ impl AdapterRouter {
                                     tracing::warn!(error = ?e, "delete placeholder failed; placeholder will remain visible");
                                 }
                             }
+                        } else if adapter.platform() == "discord"
+                            && contains_bot_mention(&final_content)
+                        {
+                            // (#1112) The streamed reply mentions another bot but carries
+                            // no [[reply_to]] directive. Editing it into the placeholder is
+                            // a MESSAGE_UPDATE, which Discord does NOT emit a mention
+                            // notification for (#1110) — so the mentioned peer would never
+                            // wake. Delete the placeholder and send the chunk(s) as fresh
+                            // messages so Discord emits MESSAGE_CREATE. (#1153 already
+                            // propagated the mention to every chunk above.)
+                            let mut send_ok = false;
+                            if let Some(first) = chunks.first() {
+                                if adapter.send_message(&thread_channel, first).await.is_ok() {
+                                    send_ok = true;
+                                }
+                            }
+                            for chunk in chunks.iter().skip(1) {
+                                let _ = adapter.send_message(&thread_channel, chunk).await;
+                            }
+                            if send_ok {
+                                if let Err(e) = adapter.delete_message(&msg).await {
+                                    tracing::warn!(error = ?e, "delete placeholder failed; placeholder will remain visible");
+                                }
+                            }
                         } else {
                             // Normal streaming: edit first chunk into placeholder, send rest
                             if let Some(first) = chunks.first() {
@@ -1211,6 +1282,153 @@ impl AdapterRouter {
             })
             .await
     }
+}
+
+/// Extract all Discord mentions (`<@123>`, `<@!123>`, `<@&123>`) from content,
+/// skipping mentions inside fenced code blocks (``` ... ```).
+/// Normalizes `<@!UID>` to `<@UID>` for deduplication (same user).
+/// Returns the deduplicated list in appearance order. (#1153)
+fn extract_mentions(content: &str) -> Vec<String> {
+    let mut mentions = Vec::new();
+    let mut in_fence = false;
+
+    for line in content.split('\n') {
+        if line.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i + 2 < bytes.len() {
+            if bytes[i] == b'<' && bytes[i + 1] == b'@' {
+                let (prefix_end, is_role) = if i + 2 < bytes.len() && bytes[i + 2] == b'&' {
+                    (i + 3, true)
+                } else if i + 2 < bytes.len() && bytes[i + 2] == b'!' {
+                    (i + 3, false)
+                } else {
+                    (i + 2, false)
+                };
+                if prefix_end < bytes.len() && bytes[prefix_end].is_ascii_digit() {
+                    if let Some(end) = line[prefix_end..].find('>') {
+                        if line[prefix_end..prefix_end + end]
+                            .chars()
+                            .all(|c| c.is_ascii_digit())
+                        {
+                            // Normalize: <@!UID> → <@UID>, keep <@&RoleID> as-is
+                            let uid = &line[prefix_end..prefix_end + end];
+                            let normalized = if is_role {
+                                format!("<@&{uid}>")
+                            } else {
+                                format!("<@{uid}>")
+                            };
+                            if !mentions.contains(&normalized) {
+                                mentions.push(normalized);
+                            }
+                            i = prefix_end + end + 1;
+                            continue;
+                        }
+                    }
+                }
+                i = prefix_end;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    mentions
+}
+
+/// Compute the char length of the mention footer that will be appended
+/// (`"\n" + mentions joined by " "`). Returns 0 if there are no mentions. (#1153)
+fn mention_footer_len(mentions: &[String]) -> usize {
+    if mentions.is_empty() {
+        return 0;
+    }
+    1 + mentions.iter().map(|m| m.len()).sum::<usize>() + mentions.len().saturating_sub(1)
+}
+
+/// Append every mention to each split chunk that does not already contain it, so
+/// receiving bots under a mention gate accept all pieces. `limit` is the hard
+/// message-length ceiling; a chunk that would exceed it after appending is left
+/// unchanged (the `mention_reserve` pre-deduction guarantees space in normal
+/// cases). No-op for a single chunk or no mentions. (#1153)
+fn propagate_mentions_to_chunks(
+    chunks: Vec<String>,
+    mentions: &[String],
+    limit: usize,
+) -> Vec<String> {
+    if mentions.is_empty() || chunks.len() <= 1 {
+        return chunks;
+    }
+    chunks
+        .into_iter()
+        .map(|chunk| {
+            let missing: Vec<&String> = mentions
+                .iter()
+                .filter(|m| !chunk_contains_mention(&chunk, m))
+                .collect();
+            if missing.is_empty() {
+                chunk
+            } else {
+                let footer = format!(
+                    "\n{}",
+                    missing
+                        .iter()
+                        .map(|m| m.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                if chunk.chars().count() + footer.chars().count() <= limit {
+                    format!("{chunk}{footer}")
+                } else {
+                    // Safety: never exceed the hard limit.
+                    chunk
+                }
+            }
+        })
+        .collect()
+}
+
+/// Check if a chunk contains an exact mention. Mentions are `<@DIGITS>`
+/// terminated by `>`, so a substring search is exact — `<@123>` cannot match
+/// inside `<@1234>` because `>` is the boundary delimiter. (#1153)
+fn chunk_contains_mention(chunk: &str, mention: &str) -> bool {
+    chunk.contains(mention)
+}
+
+/// Returns true if `content` contains a Discord user mention (`<@123>`,
+/// `<@!123>`) or role mention (`<@&123>`). Used by the streaming path to switch
+/// from edit (MESSAGE_UPDATE, no mention notification) to delete+send
+/// (MESSAGE_CREATE) so a mentioned peer actually wakes. (#1112)
+fn contains_bot_mention(content: &str) -> bool {
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'<' && bytes[i + 1] == b'@' {
+            // Skip optional '!' (nickname mention) or '&' (role mention)
+            let start =
+                if i + 2 < bytes.len() && (bytes[i + 2] == b'!' || bytes[i + 2] == b'&') {
+                    i + 3
+                } else {
+                    i + 2
+                };
+            if start < bytes.len() && bytes[start].is_ascii_digit() {
+                if let Some(end) = content[start..].find('>') {
+                    if content[start..start + end].chars().all(|c| c.is_ascii_digit()) {
+                        return true;
+                    }
+                }
+            }
+            i = start;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 /// Flatten a tool-call title into a single line safe for inline-code spans.
@@ -1526,7 +1744,8 @@ mod directive_tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        parse_output_directives, prepare_output_attachments, AdapterRouter, ChannelRef,
+        contains_bot_mention, extract_mentions, mention_footer_len, parse_output_directives,
+        prepare_output_attachments, propagate_mentions_to_chunks, AdapterRouter, ChannelRef,
         ChatAdapter, MessageRef, OutboundAttachment,
     };
 
@@ -2099,5 +2318,134 @@ mod directive_tests {
     fn parse_session_directives_rejects_malformed() {
         let err = AdapterRouter::parse_session_directives("[[ws]] do work").unwrap_err();
         assert!(err.to_string().contains("malformed session directive"));
+    }
+
+    // --- (#1153) mention extraction + propagation across split chunks ---
+
+    #[test]
+    fn extract_mentions_basic() {
+        assert_eq!(
+            extract_mentions("hello <@123> and <@&456> world"),
+            vec!["<@123>", "<@&456>"]
+        );
+    }
+
+    #[test]
+    fn extract_mentions_dedup() {
+        assert_eq!(extract_mentions("<@123> foo <@123> bar"), vec!["<@123>"]);
+    }
+
+    #[test]
+    fn extract_mentions_normalizes_nickname() {
+        assert_eq!(extract_mentions("hey <@!789>"), vec!["<@789>"]);
+    }
+
+    #[test]
+    fn extract_mentions_dedup_after_normalize() {
+        // <@123> and <@!123> are the same user
+        assert_eq!(extract_mentions("<@123> and <@!123>"), vec!["<@123>"]);
+    }
+
+    #[test]
+    fn extract_mentions_skips_code_blocks() {
+        let content = "hello <@111>\n```\n<@222>\n```\nworld <@333>";
+        assert_eq!(extract_mentions(content), vec!["<@111>", "<@333>"]);
+    }
+
+    #[test]
+    fn extract_mentions_role_vs_user_distinct() {
+        assert_eq!(
+            extract_mentions("<@&999> and <@999>"),
+            vec!["<@&999>", "<@999>"]
+        );
+    }
+
+    #[test]
+    fn extract_mentions_none() {
+        assert!(extract_mentions("no mentions; email user@example.com").is_empty());
+    }
+
+    #[test]
+    fn mention_footer_len_values() {
+        assert_eq!(mention_footer_len(&[]), 0);
+        // "\n<@123>" = 1 + 6
+        assert_eq!(mention_footer_len(&["<@123>".to_string()]), 7);
+        // "\n<@123> <@456>" = 1 + 6 + 1 + 6
+        assert_eq!(
+            mention_footer_len(&["<@123>".to_string(), "<@456>".to_string()]),
+            14
+        );
+    }
+
+    #[test]
+    fn propagate_mentions_single_chunk_noop() {
+        let chunks = vec!["hello <@123>".to_string()];
+        assert_eq!(
+            propagate_mentions_to_chunks(chunks.clone(), &["<@123>".to_string()], 2000),
+            chunks
+        );
+    }
+
+    #[test]
+    fn propagate_mentions_appends_to_missing_chunks() {
+        let chunks = vec!["part1 <@123>".to_string(), "part2 no mention".to_string()];
+        let out = propagate_mentions_to_chunks(chunks, &["<@123>".to_string()], 2000);
+        assert_eq!(out[0], "part1 <@123>");
+        assert_eq!(out[1], "part2 no mention\n<@123>");
+    }
+
+    #[test]
+    fn propagate_mentions_respects_hard_limit() {
+        // chunk already at limit: appending would exceed it, so leave unchanged.
+        let chunk = "x".repeat(2000);
+        let chunks = vec!["<@1> head".to_string(), chunk.clone()];
+        let out = propagate_mentions_to_chunks(chunks, &["<@1>".to_string()], 2000);
+        assert_eq!(out[1], chunk); // unchanged — no footer busting the 2000 ceiling
+    }
+
+    #[test]
+    fn pipeline_split_then_propagate() {
+        // End-to-end: a long mention-bearing message splits, and every chunk
+        // carries the mention after propagation.
+        let mention = "<@1514992231969456258>";
+        let body = format!("{mention} {}", "word ".repeat(800)); // ~4000+ chars
+        let mentions = extract_mentions(&body);
+        let reserve = mention_footer_len(&mentions);
+        let chunks = crate::format::split_message(&body, 2000usize.saturating_sub(reserve));
+        let chunks = propagate_mentions_to_chunks(chunks, &mentions, 2000);
+        assert!(chunks.len() >= 2, "expected the body to split");
+        for c in &chunks {
+            assert!(c.contains(mention), "every chunk must carry the mention");
+            assert!(c.chars().count() <= 2000, "no chunk exceeds the hard limit");
+        }
+    }
+
+    // --- (#1112) bot-mention detection for the streaming wake path ---
+
+    #[test]
+    fn contains_bot_mention_user() {
+        assert!(contains_bot_mention("hello <@1234567890> world"));
+    }
+
+    #[test]
+    fn contains_bot_mention_nickname() {
+        assert!(contains_bot_mention("hey <@!9876543210>"));
+    }
+
+    #[test]
+    fn contains_bot_mention_role() {
+        assert!(contains_bot_mention("calling <@&1496247626675257384>"));
+    }
+
+    #[test]
+    fn contains_bot_mention_embedded() {
+        assert!(contains_bot_mention("请问 <@1501788608439386172> 1+1=?"));
+    }
+
+    #[test]
+    fn contains_bot_mention_no_match() {
+        assert!(!contains_bot_mention("hello world"));
+        assert!(!contains_bot_mention("email user@example.com"));
+        assert!(!contains_bot_mention("<@not_a_number>"));
     }
 }
