@@ -5,6 +5,7 @@ use base64::Engine;
 use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder, ImageReader};
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tracing::{debug, error, warn};
 
@@ -164,6 +165,79 @@ fn validate_gif_body(raw: &[u8]) -> image::ImageResult<()> {
 /// `Err(MediaFetchError::ProcessingFailed)` when the body is a valid image but
 /// resize/compression fails — callers should warn the user and skip.
 ///
+/// Best-effort: download an attachment's ORIGINAL bytes and write them verbatim
+/// into `dir`, returning the saved path. Unlike `download_and_encode_image`
+/// (which resizes + re-encodes to JPEG for the model), this preserves the
+/// original file so the agent can read or copy it (e.g. into the project's
+/// `raw/`). Returns `None` on any failure (logged) — the agent still receives
+/// the image as model input regardless.
+pub async fn save_attachment_to_file(
+    url: &str,
+    filename: &str,
+    size: u64,
+    dir: &Path,
+) -> Option<PathBuf> {
+    const MAX_SAVE_BYTES: u64 = 25 * 1024 * 1024; // Discord non-Nitro attachment ceiling
+    if url.is_empty() || size > MAX_SAVE_BYTES {
+        warn!(filename, size, "skipping inbound attachment save (empty url or too large)");
+        return None;
+    }
+    let response = match HTTP_CLIENT.get(url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            warn!(url, status = %r.status(), "inbound attachment save: HTTP error");
+            return None;
+        }
+        Err(e) => {
+            warn!(url, error = %e, "inbound attachment save: download failed");
+            return None;
+        }
+    };
+    let bytes = match response.bytes().await {
+        Ok(b) if (b.len() as u64) <= MAX_SAVE_BYTES => b,
+        Ok(_) => {
+            warn!(url, "inbound attachment save: body exceeds limit");
+            return None;
+        }
+        Err(e) => {
+            warn!(url, error = %e, "inbound attachment save: read failed");
+            return None;
+        }
+    };
+    let safe = sanitize_saved_filename(filename);
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        warn!(dir = %dir.display(), error = %e, "inbound attachment save: mkdir failed");
+        return None;
+    }
+    let path = dir.join(&safe);
+    if let Err(e) = std::fs::write(&path, &bytes) {
+        warn!(path = %path.display(), error = %e, "inbound attachment save: write failed");
+        return None;
+    }
+    debug!(path = %path.display(), bytes = bytes.len(), "saved inbound attachment to workspace");
+    Some(path)
+}
+
+/// Reduce a Discord-supplied filename to a safe basename (alphanumerics plus
+/// `. _ -`; everything else becomes `_`; no path separators; capped at 128).
+fn sanitize_saved_filename(raw: &str) -> String {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+    let mut out = String::with_capacity(base.len().min(128));
+    for ch in base.chars().take(128) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('.');
+    if trimmed.is_empty() {
+        "attachment".to_string()
+    } else {
+        out
+    }
+}
+
 /// Pass `auth_token` for platforms that require authentication (e.g. Slack private files).
 pub async fn download_and_encode_image(
     url: &str,
@@ -538,6 +612,26 @@ pub async fn download_and_read_text_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_saved_filename_keeps_safe_chars() {
+        assert_eq!(sanitize_saved_filename("ref-photo_01.webp"), "ref-photo_01.webp");
+    }
+
+    #[test]
+    fn sanitize_saved_filename_strips_path_and_specials() {
+        // path separators reduced to basename; other chars -> '_'
+        assert_eq!(sanitize_saved_filename("../../etc/pa ss.png"), "pa_ss.png");
+        assert_eq!(sanitize_saved_filename("a/b/c\\d.jpg"), "d.jpg");
+        assert_eq!(sanitize_saved_filename("名字.jpeg"), "__.jpeg");
+    }
+
+    #[test]
+    fn sanitize_saved_filename_empty_or_dots_fallback() {
+        assert_eq!(sanitize_saved_filename(""), "attachment");
+        assert_eq!(sanitize_saved_filename("..."), "attachment");
+        assert_eq!(sanitize_saved_filename("///"), "attachment");
+    }
 
     fn make_png(width: u32, height: u32) -> Vec<u8> {
         let img = image::RgbImage::new(width, height);

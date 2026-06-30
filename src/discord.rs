@@ -260,6 +260,10 @@ pub struct Handler {
     pub register_goal_command: bool,
     /// Register the `/ws` slash command on this bot (default true; false on admin).
     pub register_ws_command: bool,
+    /// Container-visible workspace root (e.g. `/workspace`); used to persist
+    /// inbound attachments under `<root>/.openab/inbound/<message_id>/` so the
+    /// agent can read/copy them. `None` disables inbound persistence.
+    pub workspace_root: Option<String>,
     /// Reminder store for /remind slash command.
     pub reminder_store: ReminderStore,
     /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
@@ -946,6 +950,15 @@ impl Handler {
         let mut extra_blocks = Vec::new();
         let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
         let mut failed_image_files: Vec<String> = Vec::new();
+        // Persist inbound image attachments to disk so the agent can read/copy them
+        // (it otherwise only receives a resized model-input copy, never a file).
+        let mut saved_inbound_paths: Vec<String> = Vec::new();
+        let inbound_dir = self.workspace_root.as_deref().map(|root| {
+            std::path::PathBuf::from(root)
+                .join(".openab")
+                .join("inbound")
+                .join(msg.id.get().to_string())
+        });
         let mut text_file_bytes: u64 = 0;
         let mut text_file_count: u32 = 0;
         const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB total for all text file attachments
@@ -1023,6 +1036,19 @@ impl Handler {
                 {
                     Ok(block) => {
                         debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
+                        // Also persist the original file so the agent can copy it to raw/ etc.
+                        if let Some(ref dir) = inbound_dir {
+                            if let Some(saved) = media::save_attachment_to_file(
+                                &attachment.url,
+                                &attachment.filename,
+                                u64::from(attachment.size),
+                                dir,
+                            )
+                            .await
+                            {
+                                saved_inbound_paths.push(saved.display().to_string());
+                            }
+                        }
                         extra_blocks.push(block);
                     }
                     Err(media::MediaFetchError::NotAnImage) => {
@@ -1050,6 +1076,28 @@ impl Handler {
                     }
                 }
             }
+        }
+
+        // Tell the agent where the saved originals live so it can act on them
+        // (the model-input image alone has no filesystem path).
+        if !saved_inbound_paths.is_empty() {
+            let list = saved_inbound_paths
+                .iter()
+                .map(|p| format!("`{p}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            extra_blocks.insert(
+                0,
+                ContentBlock::Text {
+                    text: format!(
+                        "[OpenAB saved {} inbound image attachment(s) from this message to the \
+                         workspace filesystem as their original files: {}. Read or copy them with \
+                         normal shell tools — e.g. into the project's raw/ directory — to keep them.]",
+                        saved_inbound_paths.len(),
+                        list
+                    ),
+                },
+            );
         }
 
         tracing::debug!(

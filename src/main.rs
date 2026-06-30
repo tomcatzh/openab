@@ -136,6 +136,9 @@ async fn main() -> anyhow::Result<()> {
         hooks::validate_hook("pre_shutdown", hook)?;
     }
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
+    // Captured before cfg.workspace is moved into the pool; used by the Discord
+    // handler to persist inbound attachments under <root>/.openab/inbound/.
+    let workspace_root = cfg.workspace.root.clone();
 
     let pool = Arc::new(acp::SessionPool::new(
         cfg.agent,
@@ -462,6 +465,7 @@ async fn main() -> anyhow::Result<()> {
             dispatcher: discord_dispatcher,
             register_goal_command: discord_cfg.register_goal_command,
             register_ws_command: discord_cfg.register_ws_command,
+            workspace_root: workspace_root.clone(),
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         };
