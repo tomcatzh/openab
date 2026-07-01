@@ -634,15 +634,6 @@ async fn dispatch_batch(
     let batch_size = batch.len();
     let session_key = Dispatcher::session_key(thread_channel);
 
-    // Apply 👀 reaction to every message in the batch before dispatch (§6.7).
-    // Sequential — batches are typically small (≤ low single digits) so the
-    // serialization cost is sub-second and not user-visible; sequential keeps the
-    // dispatch path free of `futures_util::join_all` and easier to reason about.
-    let queued_emoji = &target.reactions_config().emojis.queued;
-    for msg in batch.iter() {
-        let _ = adapter.add_reaction(&msg.trigger_msg, queued_emoji).await;
-    }
-
     // Collect per-event observability data (before consuming the batch).
     let tokens_per_event: Vec<usize> = batch.iter().map(|m| m.estimated_tokens).collect();
     let wait_ms: Vec<u128> = batch
@@ -651,8 +642,12 @@ async fn dispatch_batch(
         .collect();
     let senders: Vec<String> = batch.iter().map(|m| m.sender_name.clone()).collect();
 
-    // Anchor reactions on the last message in the batch (before consuming).
-    let trigger_msg = batch.last().unwrap().trigger_msg.clone();
+    // Track every message in the batch (not just the last one) so the whole
+    // batch's status reactions (queued/thinking/tool/done/error/stall) stay in
+    // sync — previously only the last message was tracked, so earlier messages
+    // in a >1-message batch got the initial queued emoji but were never updated
+    // again, appearing permanently "stuck" even once the turn finished.
+    let trigger_msgs: Vec<MessageRef> = batch.iter().map(|m| m.trigger_msg.clone()).collect();
 
     let mut workspace_request: Option<WorkspaceRequest> = None;
     let mut binding_context: Option<ThreadBindingContext> = None;
@@ -736,11 +731,11 @@ async fn dispatch_batch(
     let reactions = Arc::new(StatusReactionController::new(
         reactions_config.enabled,
         adapter.clone(),
-        trigger_msg,
+        trigger_msgs,
         reactions_config.emojis.clone(),
         reactions_config.timing.clone(),
     ));
-    // 👀 already applied above; skip set_queued() to avoid double-reaction.
+    reactions.set_queued().await;
 
     let result = target
         .stream_prompt_blocks(

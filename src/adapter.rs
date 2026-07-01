@@ -805,7 +805,7 @@ impl AdapterRouter {
         let reactions = Arc::new(StatusReactionController::new(
             self.reactions_config.enabled,
             adapter.clone(),
-            ctx.trigger_msg.clone(),
+            vec![ctx.trigger_msg.clone()],
             self.reactions_config.emojis.clone(),
             self.reactions_config.timing.clone(),
         ));
