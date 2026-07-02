@@ -209,13 +209,41 @@ pub async fn save_attachment_to_file(
         warn!(dir = %dir.display(), error = %e, "inbound attachment save: mkdir failed");
         return None;
     }
-    let path = dir.join(&safe);
+    let path = dedupe_save_path(dir, &safe);
     if let Err(e) = std::fs::write(&path, &bytes) {
         warn!(path = %path.display(), error = %e, "inbound attachment save: write failed");
         return None;
     }
     debug!(path = %path.display(), bytes = bytes.len(), "saved inbound attachment to workspace");
     Some(path)
+}
+
+/// Resolve a collision-free path for `safe` inside `dir`: two attachments in
+/// the SAME message can sanitize to the same name (e.g. two pure-CJK filenames
+/// both become `__.jpg`), and a silent overwrite would lose the first file.
+/// Suffix `-1`, `-2`, … before the extension until the name is free.
+fn dedupe_save_path(dir: &Path, safe: &str) -> PathBuf {
+    let path = dir.join(safe);
+    if !path.exists() {
+        return path;
+    }
+    let p = Path::new(safe);
+    let stem = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("attachment");
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    for i in 1u32.. {
+        let candidate = dir.join(format!("{stem}-{i}{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("u32 counter exhausted resolving save-path collision")
 }
 
 /// Reduce a Discord-supplied filename to a safe basename (alphanumerics plus
@@ -631,6 +659,28 @@ mod tests {
         assert_eq!(sanitize_saved_filename(""), "attachment");
         assert_eq!(sanitize_saved_filename("..."), "attachment");
         assert_eq!(sanitize_saved_filename("///"), "attachment");
+    }
+
+    #[test]
+    fn dedupe_save_path_suffixes_on_collision() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let dir = tmp.path();
+        // First save: plain name.
+        let p1 = dedupe_save_path(dir, "__.jpg");
+        assert_eq!(p1, dir.join("__.jpg"));
+        std::fs::write(&p1, b"one").unwrap();
+        // Second attachment in the same message sanitizing to the same name
+        // must NOT overwrite the first.
+        let p2 = dedupe_save_path(dir, "__.jpg");
+        assert_eq!(p2, dir.join("__-1.jpg"));
+        std::fs::write(&p2, b"two").unwrap();
+        let p3 = dedupe_save_path(dir, "__.jpg");
+        assert_eq!(p3, dir.join("__-2.jpg"));
+        // Extension-less names also dedupe.
+        std::fs::write(dir.join("attachment"), b"x").unwrap();
+        assert_eq!(dedupe_save_path(dir, "attachment"), dir.join("attachment-1"));
+        // Original file content untouched.
+        assert_eq!(std::fs::read(dir.join("__.jpg")).unwrap(), b"one");
     }
 
     fn make_png(width: u32, height: u32) -> Vec<u8> {

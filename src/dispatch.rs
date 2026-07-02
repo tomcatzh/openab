@@ -649,6 +649,20 @@ async fn dispatch_batch(
     // again, appearing permanently "stuck" even once the turn finished.
     let trigger_msgs: Vec<MessageRef> = batch.iter().map(|m| m.trigger_msg.clone()).collect();
 
+    // Construct the controller and ack (👀) BEFORE directive parsing and
+    // ensure_session: session creation can spawn the agent (seconds on a cold
+    // thread) and the user should get an immediate receipt. Error paths below
+    // transition to 😱 instead of leaving a stale 👀.
+    let reactions_config = target.reactions_config().clone();
+    let reactions = Arc::new(StatusReactionController::new(
+        reactions_config.enabled,
+        adapter.clone(),
+        trigger_msgs,
+        reactions_config.emojis.clone(),
+        reactions_config.timing.clone(),
+    ));
+    reactions.set_queued().await;
+
     let mut workspace_request: Option<WorkspaceRequest> = None;
     let mut binding_context: Option<ThreadBindingContext> = None;
     let mut cleaned_batch = Vec::with_capacity(batch.len());
@@ -665,6 +679,7 @@ async fn dispatch_batch(
                         )
                         .await;
                     error!("session directive found in an existing dispatch batch");
+                    reactions.set_error().await;
                     return;
                 }
                 if let Some(adapter_workspace) = adapter_workspace {
@@ -677,6 +692,7 @@ async fn dispatch_batch(
                                 )
                                 .await;
                             error!("conflicting adapter workspace directives in dispatch_batch");
+                            reactions.set_error().await;
                             return;
                         }
                     } else {
@@ -695,6 +711,7 @@ async fn dispatch_batch(
                     .send_message(thread_channel, &format!("⚠️ {user_msg}"))
                     .await;
                 error!("session directive parse error in dispatch_batch: {e}");
+                reactions.set_error().await;
                 return;
             }
         }
@@ -724,18 +741,9 @@ async fn dispatch_batch(
             .send_message(thread_channel, &format!("⚠️ {user_msg}"))
             .await;
         error!("pool error in dispatch_batch: {e}");
+        reactions.set_error().await;
         return;
     }
-
-    let reactions_config = target.reactions_config().clone();
-    let reactions = Arc::new(StatusReactionController::new(
-        reactions_config.enabled,
-        adapter.clone(),
-        trigger_msgs,
-        reactions_config.emojis.clone(),
-        reactions_config.timing.clone(),
-    ));
-    reactions.set_queued().await;
 
     let result = target
         .stream_prompt_blocks(

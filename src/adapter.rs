@@ -962,6 +962,13 @@ impl AdapterRouter {
                     // messages and abandons cleanly on dead agent / hard ceiling
                     // so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
+                    // (bd16546) Soft diagnostic for a clean end_turn with 0 output tokens.
+                    // Kept separate from response_error because it must surface ONLY when
+                    // the reply would otherwise be "_(no response)_" — a turn that streamed
+                    // text or tool activity is not silent, and prefixing it with a scary
+                    // provider-failure warning would be a false positive (e.g. a bridge
+                    // that stubs usage to zeros).
+                    let mut silent_turn_diag: Option<String> = None;
                     let prompt_start = tokio::time::Instant::now();
                     loop {
                         let notification = tokio::select! {
@@ -1014,14 +1021,17 @@ impl AdapterRouter {
                             if let Some(ref err) = notification.error {
                                 response_error = Some(format_coded_error(err.code, &err.message, err.data_message()));
                             } else if let Some(ref result) = notification.result {
-                                // (bd16546) A successful turn that ends with
-                                // stopReason="end_turn" but zero output tokens is a strong
-                                // signal of a silent provider/auth failure (e.g. the backend
-                                // accepted the prompt, returned an empty completion, and the
-                                // bridge reported a clean end_turn). Surface a diagnostic
-                                // instead of falling through to "_(no response)_".
+                                // (bd16546) A turn that ends with stopReason="end_turn" but
+                                // zero output tokens is a strong signal of a silent
+                                // provider/auth failure. Record it as a SOFT diagnostic: it
+                                // replaces "_(no response)_" below, but never prefixes a
+                                // reply that actually produced text/tool output.
                                 if parse_turn_result(result).is_silent_failure() {
-                                    response_error = Some(
+                                    tracing::warn!(
+                                        "turn ended with end_turn and 0 output tokens \
+                                         (possible silent provider/auth failure)"
+                                    );
+                                    silent_turn_diag = Some(
                                         "Agent ended the turn with no output (0 output tokens) \
                                          — likely a silent provider or auth failure"
                                             .into(),
@@ -1130,6 +1140,10 @@ impl AdapterRouter {
                             "Attached requested file(s).".to_string()
                         } else if !attachment_warnings.is_empty() {
                             String::new()
+                        } else if let Some(diag) = silent_turn_diag.as_ref() {
+                            // (bd16546) exactly the case that would otherwise render as
+                            // "_(no response)_" — surface the diagnostic instead.
+                            format!("⚠️ {diag}")
                         } else {
                             "_(no response)_".to_string()
                         }
